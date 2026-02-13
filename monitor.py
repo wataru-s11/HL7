@@ -40,14 +40,9 @@ VITAL_ORDER = [
     "BSR2",
 ]
 
-INT_VITALS = {
-    "HR", "ART_S", "ART_D", "ART_M", "CVP_M", "RAP_M", "SpO2", "rRESP", "EtCO2", "RR",
-    "VTe", "VTi", "Ppeak", "PEEP", "O2conc", "NO", "BSR1", "BSR2",
-}
 DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
-RIGHT_TEXT_SAFE_MARGIN = 6
 CELL_BORDER_MARGIN = 2
 
 
@@ -62,20 +57,23 @@ def parse_timestamp(ts: str | None) -> datetime | None:
     return None
 
 
-def format_value_candidates(vital: str, value) -> list[str]:
+def format_value(vital_key: str, value) -> str:
     if value is None:
-        return [MISSING_PLACEHOLDER]
+        return MISSING_PLACEHOLDER
     try:
         num = float(value)
     except (TypeError, ValueError):
-        return [MISSING_PLACEHOLDER]
+        return MISSING_PLACEHOLDER
 
-    if vital in DEC1_VITALS:
-        # 温度は常に小数1桁を維持（ゼロ埋めなし）
-        return [f"{num:.1f}"]
-    if vital in INT_VITALS:
-        return [str(int(round(num)))]
-    return [f"{num:.1f}", f"{int(round(num))}"]
+    if vital_key in ("TSKIN", "TRECT"):
+        return f"{num:.1f}"
+    return f"{int(round(num))}"
+
+
+def format_value_candidates(vital: str, value) -> list[str]:
+    if value is None:
+        return [MISSING_PLACEHOLDER]
+    return [format_value(vital, value)]
 
 
 def shorten_text_for_fit(text: str, allow_decimal_drop: bool = True) -> list[str]:
@@ -91,7 +89,7 @@ def shorten_text_for_fit(text: str, allow_decimal_drop: bool = True) -> list[str
         candidates.append(str(int(round(num))))
 
     # 要件: それでも入らない場合は整数化し、3〜4文字程度に短縮。
-    if num is not None:
+    if allow_decimal_drop and num is not None:
         rounded = int(round(num))
         reduced = str(rounded)
         if len(reduced) > 4:
@@ -338,7 +336,7 @@ class MonitorApp:
         value_bottom = max(c_h - self.value_pad_bottom, value_top + 1)
 
         left_inset = self.value_pad_left + CELL_BORDER_MARGIN
-        right_inset = self.value_pad_right + RIGHT_TEXT_SAFE_MARGIN + CELL_BORDER_MARGIN
+        right_inset = self.value_pad_right + 10 + CELL_BORDER_MARGIN
 
         avail_w = max(c_w - (left_inset + right_inset), 1)
         avail_h = max(value_bottom - value_top, 1)
@@ -363,8 +361,8 @@ class MonitorApp:
         x = min(max(x, min_x), max_x)
 
         center_y = (value_top + value_bottom) / 2.0
-        min_y = value_top + (text_h / 2.0)
-        max_y = value_bottom - (text_h / 2.0)
+        min_y = value_top + self.value_pad_top + (text_h / 2.0) + CELL_BORDER_MARGIN
+        max_y = value_bottom - self.value_pad_bottom - (text_h / 2.0) - CELL_BORDER_MARGIN
         if max_y < min_y:
             y = center_y
         else:
