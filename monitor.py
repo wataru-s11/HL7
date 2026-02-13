@@ -133,7 +133,7 @@ class MonitorApp:
         self.default_col_gap = 8
         self.default_row_gap = 6
         self.value_pad_x = 6
-        self.value_pad_y = 4
+        self.value_pad_y = 0
         self.value_pad_left = self.value_pad_x
         self.value_pad_right = self.value_pad_x
         self.value_pad_top = self.value_pad_y
@@ -206,7 +206,7 @@ class MonitorApp:
                 self.vital_name_labels.append(name_lbl)
 
                 value_canvas = tk.Canvas(cell, bg="white", highlightthickness=0, bd=0)
-                value_canvas.pack(fill="both", expand=True, padx=2, pady=(0, 4))
+                value_canvas.pack(fill="both", expand=True, padx=2, pady=0)
                 item_id = value_canvas.create_text(2, 2, text="NA", anchor="e", fill="black", font=self.value_font)
                 self.value_canvases[(bed, vital)] = value_canvas
                 self.value_items[(bed, vital)] = item_id
@@ -393,8 +393,7 @@ class MonitorApp:
         max_x = max(min_x, right - right_inset)
         x = min(max(x, min_x), max_x)
 
-        # 下寄せで欠けるのを防ぐため、y は常にセル中央基準で配置する。
-        # 必要に応じて VALUE_Y_FACTOR を 0.48〜0.52 の範囲で微調整する。
+        # 初期 y は中央基準。最終的な欠け防止は bbox 補正で保証する。
         y = value_top + (value_bottom - value_top) * VALUE_Y_FACTOR
 
         # デバッグ（右上セルひとつ）
@@ -407,6 +406,20 @@ class MonitorApp:
 
         canvas.coords(item_id, x, y)
         canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "normal"), anchor="e")
+
+        # 実描画 bbox で上下のはみ出しを補正し、どの解像度でも欠けを防ぐ。
+        bbox = canvas.bbox(item_id)
+        if bbox:
+            top = bbox[1]
+            bottom = bbox[3]
+            dy = 0
+            if top < value_top:
+                dy = value_top - top
+            elif bottom > value_bottom:
+                dy = value_bottom - bottom
+            if dy:
+                canvas.move(item_id, 0, dy)
+                y += dy
 
         # デバッグ用: 1セルだけ値テキスト基準点を赤丸で描画。
         if bed == "BED01" and vital == "HR":
