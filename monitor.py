@@ -93,6 +93,10 @@ class MonitorApp:
         value_font = font.Font(family="Consolas", size=40, weight="bold")
         time_font = font.Font(family="Consolas", size=12)
 
+        header_h = 48
+        body_w = 1920
+        body_h = 1080 - header_h
+
         header = tk.Label(
             self.root,
             text="HL7 MONITOR (Fixed Layout 4x5 / Bed)",
@@ -101,16 +105,16 @@ class MonitorApp:
             font=title_font,
             anchor="w",
         )
-        header.pack(fill="x", padx=12, pady=(4, 4))
+        header.place(x=12, y=4, width=1896, height=40)
 
-        body = tk.Frame(self.root, bg="white", width=1920, height=1040)
-        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        body = tk.Frame(self.root, bg="white", width=body_w, height=body_h)
+        body.place(x=0, y=header_h, width=body_w, height=body_h)
         body.pack_propagate(False)
 
         for r in range(3):
-            body.grid_rowconfigure(r, minsize=340, weight=0)
+            body.grid_rowconfigure(r, minsize=344, weight=0)
         for c in range(2):
-            body.grid_columnconfigure(c, minsize=952, weight=0)
+            body.grid_columnconfigure(c, minsize=960, weight=0)
 
         self.cells: dict[tuple[str, str], tk.Label] = {}
         self.updated_labels: dict[str, tk.Label] = {}
@@ -119,7 +123,7 @@ class MonitorApp:
             row_idx = i // 2
             col_idx = i % 2
 
-            bed_frame = tk.Frame(body, bg="white", bd=2, relief="solid", width=944, height=334)
+            bed_frame = tk.Frame(body, bg="white", bd=2, relief="solid", width=952, height=338)
             bed_frame.grid(row=row_idx, column=col_idx, padx=4, pady=3)
             bed_frame.grid_propagate(False)
 
@@ -144,12 +148,12 @@ class MonitorApp:
             self.updated_labels[bed] = updated_lbl
 
             for c in range(4):
-                bed_frame.grid_columnconfigure(c, minsize=231, weight=0)
+                bed_frame.grid_columnconfigure(c, minsize=233, weight=0)
 
             for i, vital in enumerate(VITAL_ORDER):
                 row = 2 + (i // 4)
                 col = i % 4
-                cell = tk.Frame(bed_frame, bg="white", bd=1, relief="solid", width=223, height=50)
+                cell = tk.Frame(bed_frame, bg="white", bd=1, relief="solid", width=225, height=50)
                 cell.grid(row=row, column=col, padx=2, pady=2)
                 cell.grid_propagate(False)
 
