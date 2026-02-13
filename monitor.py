@@ -155,6 +155,7 @@ class MonitorApp:
 
         self.value_canvases: dict[tuple[str, str], tk.Canvas] = {}
         self.value_items: dict[tuple[str, str], int] = {}
+        self.value_debug_markers: dict[tuple[str, str], int] = {}
         self.updated_labels: dict[str, tk.Label] = {}
         self.bed_frames: dict[str, tk.Frame] = {}
         self.cell_frames: list[tk.Frame] = []
@@ -202,7 +203,7 @@ class MonitorApp:
 
                 value_canvas = tk.Canvas(cell, bg="white", highlightthickness=0, bd=0)
                 value_canvas.pack(fill="both", expand=True, padx=2, pady=(0, 4))
-                item_id = value_canvas.create_text(2, 2, text="NA", anchor="se", fill="black", font=self.value_font)
+                item_id = value_canvas.create_text(2, 2, text="NA", anchor="e", fill="black", font=self.value_font)
                 self.value_canvases[(bed, vital)] = value_canvas
                 self.value_items[(bed, vital)] = item_id
 
@@ -320,25 +321,36 @@ class MonitorApp:
         c_w = max(canvas.winfo_width(), 1)
         c_h = max(canvas.winfo_height(), 1)
         left = 0
-        top = 0
         right = c_w
-        bottom = c_h
+
+        # ラベル行があるレイアウトでも値の描画領域が下側になるよう、
+        # canvas の実効 top/bottom を基準に扱う。
+        value_top = self.value_pad_top
+        value_bottom = max(c_h - self.value_pad_bottom, value_top + 1)
+
         avail_w = max(c_w - (self.value_pad_left + self.value_pad_right), 1)
-        avail_h = max(c_h - (self.value_pad_top + self.value_pad_bottom), 1)
+        avail_h = max(value_bottom - value_top, 1)
 
         text, size, text_w, text_h = self.fit_text_to_box(candidates, avail_w, avail_h)
 
-        # 右寄せ: 右端 - pad_right - width。必ずセル内へ clamp。
-        x = right - self.value_pad_right - text_w
+        self.value_measure_font.configure(size=size)
+        ascent = int(self.value_measure_font.metrics("ascent"))
+        descent = int(self.value_measure_font.metrics("descent"))
+        text_h = ascent + descent
+
+        # 右寄せ + 縦中央。
+        x = right - self.value_pad_right
         min_x = left + self.value_pad_left
-        max_x = max(min_x, right - self.value_pad_right - text_w)
+        max_x = max(min_x, right - self.value_pad_right)
         x = min(max(x, min_x), max_x)
 
-        # 縦位置もセル内へ clamp。
-        y = bottom - self.value_pad_bottom - text_h
-        min_y = top + self.value_pad_top
-        max_y = max(min_y, bottom - self.value_pad_bottom - text_h)
-        y = min(max(y, min_y), max_y)
+        center_y = (value_top + value_bottom) / 2.0
+        min_y = value_top + (text_h / 2.0)
+        max_y = value_bottom - (text_h / 2.0)
+        if max_y < min_y:
+            y = center_y
+        else:
+            y = min(max(center_y, min_y), max_y)
 
         # デバッグ（右上セルひとつ）
         if not self.fit_debug_logged and bed == "BED01" and vital == "HR":
@@ -349,7 +361,17 @@ class MonitorApp:
             self.fit_debug_logged = True
 
         canvas.coords(item_id, x, y)
-        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "normal"), anchor="nw")
+        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "normal"), anchor="e")
+
+        # デバッグ用: 1セルだけ値テキスト基準点を赤丸で描画。
+        if bed == "BED01" and vital == "HR":
+            marker_id = self.value_debug_markers.get((bed, vital))
+            r = 3
+            if marker_id is None:
+                marker_id = canvas.create_oval(x - r, y - r, x + r, y + r, fill="red", outline="red")
+                self.value_debug_markers[(bed, vital)] = marker_id
+            else:
+                canvas.coords(marker_id, x - r, y - r, x + r, y + r)
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
