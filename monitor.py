@@ -47,6 +47,8 @@ INT_VITALS = {
 DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
+RIGHT_TEXT_SAFE_MARGIN = 6
+CELL_BORDER_MARGIN = 2
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -69,14 +71,14 @@ def format_value_candidates(vital: str, value) -> list[str]:
         return [MISSING_PLACEHOLDER]
 
     if vital in DEC1_VITALS:
-        # 温度は 34.5 表記を維持（ゼロ埋めなし）
-        return [f"{num:.1f}", f"{int(round(num))}"]
+        # 温度は常に小数1桁を維持（ゼロ埋めなし）
+        return [f"{num:.1f}"]
     if vital in INT_VITALS:
         return [str(int(round(num)))]
     return [f"{num:.1f}", f"{int(round(num))}"]
 
 
-def shorten_text_for_fit(text: str) -> list[str]:
+def shorten_text_for_fit(text: str, allow_decimal_drop: bool = True) -> list[str]:
     """fit-to-box 用の表示短縮候補を優先順で返す。"""
     candidates: list[str] = [text]
     try:
@@ -85,7 +87,7 @@ def shorten_text_for_fit(text: str) -> list[str]:
         num = None
 
     # 要件: 小数は 1桁 -> 0桁 へ短縮。
-    if num is not None and "." in str(text):
+    if allow_decimal_drop and num is not None and "." in str(text):
         candidates.append(str(int(round(num))))
 
     # 要件: それでも入らない場合は整数化し、3〜4文字程度に短縮。
@@ -241,7 +243,8 @@ class MonitorApp:
 
         safe_cell_h = max(int(cell_h * 0.95), 1)
         value_available_h = max(safe_cell_h - (self.value_pad_y * 2), 1)
-        value_font_size = max(int(cell_h * 0.75), MIN_VALUE_FONT_SIZE)
+        # 値フォントは従来より 2〜4px 程度大きくしつつ、実際の描画時は fit-to-box で必ず収める。
+        value_font_size = max(int(cell_h * 0.75) + 3, MIN_VALUE_FONT_SIZE)
         while value_font_size > 6:
             self.value_font.configure(size=value_font_size)
             metrics = self.value_font.metrics()
@@ -275,7 +278,7 @@ class MonitorApp:
         self.render_from_payload()
 
     def _fit_single_text(self, text: str, avail_w: int, avail_h: int) -> tuple[bool, int, int, int]:
-        start_size = int(min(avail_h * 0.85, 44))
+        start_size = int(min(avail_h * 0.85 + 3, 48))
         font_size = max(start_size, MIN_VALUE_FONT_SIZE)
 
         while font_size >= MIN_VALUE_FONT_SIZE:
@@ -291,13 +294,19 @@ class MonitorApp:
         height = int(self.value_measure_font.metrics("ascent")) + int(self.value_measure_font.metrics("descent"))
         return (width <= avail_w and height <= avail_h), MIN_VALUE_FONT_SIZE, width, height
 
-    def fit_text_to_box(self, text_candidates: list[str], avail_w: int, avail_h: int) -> tuple[str, int, int, int]:
+    def fit_text_to_box(
+        self,
+        text_candidates: list[str],
+        avail_w: int,
+        avail_h: int,
+        allow_decimal_drop: bool = True,
+    ) -> tuple[str, int, int, int]:
         avail_w = max(avail_w, 1)
         avail_h = max(avail_h, 1)
 
         fit_attempts: list[str] = []
         for text in text_candidates:
-            for candidate in shorten_text_for_fit(text):
+            for candidate in shorten_text_for_fit(text, allow_decimal_drop=allow_decimal_drop):
                 if candidate not in fit_attempts:
                     fit_attempts.append(candidate)
 
@@ -328,10 +337,19 @@ class MonitorApp:
         value_top = self.value_pad_top
         value_bottom = max(c_h - self.value_pad_bottom, value_top + 1)
 
-        avail_w = max(c_w - (self.value_pad_left + self.value_pad_right), 1)
+        left_inset = self.value_pad_left + CELL_BORDER_MARGIN
+        right_inset = self.value_pad_right + RIGHT_TEXT_SAFE_MARGIN + CELL_BORDER_MARGIN
+
+        avail_w = max(c_w - (left_inset + right_inset), 1)
         avail_h = max(value_bottom - value_top, 1)
 
-        text, size, text_w, text_h = self.fit_text_to_box(candidates, avail_w, avail_h)
+        is_temp_vital = vital in DEC1_VITALS
+        text, size, text_w, text_h = self.fit_text_to_box(
+            candidates,
+            avail_w,
+            avail_h,
+            allow_decimal_drop=not is_temp_vital,
+        )
 
         self.value_measure_font.configure(size=size)
         ascent = int(self.value_measure_font.metrics("ascent"))
@@ -339,9 +357,9 @@ class MonitorApp:
         text_h = ascent + descent
 
         # 右寄せ + 縦中央。
-        x = right - self.value_pad_right
-        min_x = left + self.value_pad_left
-        max_x = max(min_x, right - self.value_pad_right)
+        x = right - right_inset
+        min_x = left + left_inset + text_w
+        max_x = max(min_x, right - right_inset)
         x = min(max(x, min_x), max_x)
 
         center_y = (value_top + value_bottom) / 2.0
