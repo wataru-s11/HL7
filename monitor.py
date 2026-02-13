@@ -44,7 +44,6 @@ DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 2
-VALUE_Y_FACTOR = 0.50
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -139,7 +138,6 @@ class MonitorApp:
         self.value_pad_top = self.value_pad_y
         self.value_pad_bottom = self.value_pad_y
         self.max_value_font_size = 40
-        self.fit_debug_logged = False
         self._redrawing = False
 
         self.header = tk.Label(
@@ -157,9 +155,7 @@ class MonitorApp:
         self.canvas_w = 1
         self.canvas_h = 1
 
-        self.value_canvases: dict[tuple[str, str], tk.Canvas] = {}
-        self.value_items: dict[tuple[str, str], int] = {}
-        self.value_debug_markers: dict[tuple[str, str], int] = {}
+        self.value_labels: dict[tuple[str, str], tk.Label] = {}
         self.updated_labels: dict[str, tk.Label] = {}
         self.bed_frames: dict[str, tk.Frame] = {}
         self.cell_frames: list[tk.Frame] = []
@@ -205,11 +201,17 @@ class MonitorApp:
                 name_lbl.pack(anchor="nw", padx=5, pady=(0, 0))
                 self.vital_name_labels.append(name_lbl)
 
-                value_canvas = tk.Canvas(cell, bg="white", highlightthickness=0, bd=0)
-                value_canvas.pack(fill="both", expand=True, padx=2, pady=0)
-                item_id = value_canvas.create_text(2, 2, text="NA", anchor="e", fill="black", font=self.value_font)
-                self.value_canvases[(bed, vital)] = value_canvas
-                self.value_items[(bed, vital)] = item_id
+                value_label = tk.Label(
+                    cell,
+                    text="NA",
+                    bg="white",
+                    fg="black",
+                    font=self.value_font,
+                    anchor="se",
+                    justify="right",
+                )
+                value_label.pack(fill="both", expand=True, padx=2, pady=0)
+                self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
         self.relayout()
@@ -354,82 +356,29 @@ class MonitorApp:
         return fallback, MIN_VALUE_FONT_SIZE, width, height
 
     def render_value(self, bed: str, vital: str, candidates: list[str]):
-        canvas = self.value_canvases[(bed, vital)]
-        item_id = self.value_items[(bed, vital)]
+        value_label = self.value_labels[(bed, vital)]
 
-        canvas.update_idletasks()
-        c_w = max(canvas.winfo_width(), 1)
-        c_h = max(canvas.winfo_height(), 1)
-        left = 0
-        right = c_w
-
-        # ラベル行があるレイアウトでも値の描画領域が下側になるよう、
-        # canvas の実効 top/bottom を基準に扱う。
-        value_top = self.value_pad_top
-        value_bottom = max(c_h - self.value_pad_bottom, value_top + 1)
+        value_label.update_idletasks()
+        label_w = max(value_label.winfo_width(), 1)
+        label_h = max(value_label.winfo_height(), 1)
 
         left_inset = self.value_pad_left + CELL_BORDER_MARGIN
-        right_inset = self.value_pad_right + 10 + CELL_BORDER_MARGIN
+        right_inset = self.value_pad_right + CELL_BORDER_MARGIN
+        top_inset = self.value_pad_top
+        bottom_inset = self.value_pad_bottom
 
-        avail_w = max(c_w - (left_inset + right_inset), 1)
-        avail_h = max(value_bottom - value_top, 1)
+        avail_w = max(label_w - (left_inset + right_inset), 1)
+        avail_h = max(label_h - (top_inset + bottom_inset), 1)
 
         is_temp_vital = vital in DEC1_VITALS
-        text, size, text_w, text_h = self.fit_text_to_box(
+        text, size, _, _ = self.fit_text_to_box(
             candidates,
             avail_w,
             avail_h,
             allow_decimal_drop=not is_temp_vital,
         )
 
-        self.value_measure_font.configure(size=size)
-        ascent = int(self.value_measure_font.metrics("ascent"))
-        descent = int(self.value_measure_font.metrics("descent"))
-        text_h = ascent + descent
-
-        # 右寄せ + 縦中央。
-        x = right - right_inset
-        min_x = left + left_inset + text_w
-        max_x = max(min_x, right - right_inset)
-        x = min(max(x, min_x), max_x)
-
-        # 初期 y は中央基準。最終的な欠け防止は bbox 補正で保証する。
-        y = value_top + (value_bottom - value_top) * VALUE_Y_FACTOR
-
-        # デバッグ（右上セルひとつ）
-        if not self.fit_debug_logged and bed == "BED01" and vital == "HR":
-            print(
-                f"[fit-debug] {bed}/{vital}: text={text}, avail_w={avail_w}, measured_w={text_w}, chosen_font_size={size}",
-                flush=True,
-            )
-            self.fit_debug_logged = True
-
-        canvas.coords(item_id, x, y)
-        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "normal"), anchor="e")
-
-        # 実描画 bbox で上下のはみ出しを補正し、どの解像度でも欠けを防ぐ。
-        bbox = canvas.bbox(item_id)
-        if bbox:
-            top = bbox[1]
-            bottom = bbox[3]
-            dy = 0
-            if top < value_top:
-                dy = value_top - top
-            elif bottom > value_bottom:
-                dy = value_bottom - bottom
-            if dy:
-                canvas.move(item_id, 0, dy)
-                y += dy
-
-        # デバッグ用: 1セルだけ値テキスト基準点を赤丸で描画。
-        if bed == "BED01" and vital == "HR":
-            marker_id = self.value_debug_markers.get((bed, vital))
-            r = 3
-            if marker_id is None:
-                marker_id = canvas.create_oval(x - r, y - r, x + r, y + r, fill="red", outline="red")
-                self.value_debug_markers[(bed, vital)] = marker_id
-            else:
-                canvas.coords(marker_id, x - r, y - r, x + r, y + r)
+        value_label.configure(text=text, font=("Consolas", size, "normal"), anchor="se", justify="right")
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
