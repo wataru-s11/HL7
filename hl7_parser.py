@@ -34,6 +34,12 @@ class HL7Message:
 
 
 class HL7Parser:
+    DIRECT_VITAL_KEYS = {
+        "HR", "ART_S", "ART_D", "ART_M", "CVP_M", "RAP_M",
+        "SpO2", "TSKIN", "TRECT", "rRESP", "EtCO2", "RR",
+        "VTe", "VTi", "Ppeak", "PEEP", "O2conc", "NO", "BSR1", "BSR2",
+    }
+
     OBSERVATION_MAPPING = {
         "8867-4": "HR",
         "2708-6": "SpO2",
@@ -151,7 +157,10 @@ class HL7Parser:
         obs_components = self.split_component(fields[3])
         observation_id = obs_components[0] if obs_components else ""
         observation_name_raw = obs_components[1] if len(obs_components) > 1 else ""
-        observation_name = self.OBSERVATION_MAPPING.get(observation_id, observation_name_raw)
+        if observation_id in self.DIRECT_VITAL_KEYS:
+            observation_name = observation_id
+        else:
+            observation_name = self.OBSERVATION_MAPPING.get(observation_id, observation_name_raw)
 
         value = None
         value_str = fields[5]
