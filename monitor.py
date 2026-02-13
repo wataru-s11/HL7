@@ -45,7 +45,7 @@ INT_VITALS = {
     "VTe", "VTi", "Ppeak", "PEEP", "O2conc", "NO", "BSR1", "BSR2",
 }
 DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
-MIN_VALUE_FONT_SIZE = 24
+MIN_VALUE_FONT_SIZE = 18
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -75,22 +75,32 @@ def format_value_candidates(vital: str, value, stale: bool) -> list[str]:
     return [f"{num:.1f}", f"{int(round(num))}"]
 
 
-def shorten_text_candidates(text: str) -> list[str]:
-    candidates = [text]
-    if "." in text:
-        candidates.append(text.split(".")[0])
+def shorten_text_for_fit(text: str) -> list[str]:
+    """fit-to-box 用の表示短縮候補を優先順で返す。"""
+    candidates: list[str] = [text]
+    try:
+        num = float(text)
+    except (TypeError, ValueError):
+        num = None
 
-    sign = ""
-    body = text
-    if body.startswith(("+", "-")):
-        sign, body = body[0], body[1:]
-    for keep in range(len(body) - 1, 0, -1):
-        candidates.append(f"{sign}{body[-keep:]}")
-    candidates.append(body[-1:] or "0")
+    # 要件: 小数は 1桁 -> 0桁 へ短縮。
+    if num is not None and "." in str(text):
+        candidates.append(str(int(round(num))))
+
+    # 要件: それでも入らない場合は 3 桁に丸める/クリップしない。
+    if num is not None:
+        rounded = int(round(num))
+        clipped = max(min(rounded, 999), -99)
+        if clipped < 0:
+            candidates.append(f"-{abs(clipped):02d}")
+        else:
+            candidates.append(f"{clipped:03d}")
+    else:
+        candidates.append("###")
 
     uniq: list[str] = []
     for c in candidates:
-        if c and c not in uniq:
+        if c not in uniq:
             uniq.append(c)
     return uniq
 
@@ -125,7 +135,12 @@ class MonitorApp:
         self.default_row_gap = 6
         self.value_pad_x = 6
         self.value_pad_y = 4
+        self.value_pad_left = self.value_pad_x
+        self.value_pad_right = self.value_pad_x
+        self.value_pad_top = self.value_pad_y
+        self.value_pad_bottom = self.value_pad_y
         self.max_value_font_size = 40
+        self.fit_debug_logged = False
 
         self.header = tk.Label(
             self.root,
@@ -260,29 +275,44 @@ class MonitorApp:
 
         self.render_from_payload()
 
-    def fit_text_to_box(self, text_candidates: list[str], box_w: int, box_h: int) -> tuple[str, int]:
-        box_w = max(box_w, 1)
-        box_h = max(box_h, 1)
+    def _fit_single_text(self, text: str, avail_w: int, avail_h: int) -> tuple[bool, int, int, int]:
+        start_size = int(min(avail_h * 0.85, 44))
+        font_size = max(start_size, MIN_VALUE_FONT_SIZE)
 
-        expanded: list[str] = []
-        for text in text_candidates:
-            for candidate in shorten_text_candidates(text):
-                if candidate not in expanded:
-                    expanded.append(candidate)
-
-        for size in range(self.max_value_font_size, MIN_VALUE_FONT_SIZE - 1, -1):
-            self.value_measure_font.configure(size=size)
-            if self.value_measure_font.metrics("linespace") > box_h:
-                continue
-            for text in expanded:
-                if self.value_measure_font.measure(text) <= box_w:
-                    return text, size
+        while font_size >= MIN_VALUE_FONT_SIZE:
+            self.value_measure_font.configure(size=font_size)
+            width = int(self.value_measure_font.measure(text))
+            height = int(self.value_measure_font.metrics("ascent")) + int(self.value_measure_font.metrics("descent"))
+            if width <= avail_w and height <= avail_h:
+                return True, font_size, width, height
+            font_size -= 2
 
         self.value_measure_font.configure(size=MIN_VALUE_FONT_SIZE)
-        for text in expanded:
-            if self.value_measure_font.measure(text) <= box_w:
-                return text, MIN_VALUE_FONT_SIZE
-        return (expanded[-1] if expanded else "NA"), MIN_VALUE_FONT_SIZE
+        width = int(self.value_measure_font.measure(text))
+        height = int(self.value_measure_font.metrics("ascent")) + int(self.value_measure_font.metrics("descent"))
+        return (width <= avail_w and height <= avail_h), MIN_VALUE_FONT_SIZE, width, height
+
+    def fit_text_to_box(self, text_candidates: list[str], avail_w: int, avail_h: int) -> tuple[str, int, int, int]:
+        avail_w = max(avail_w, 1)
+        avail_h = max(avail_h, 1)
+
+        fit_attempts: list[str] = []
+        for text in text_candidates:
+            for candidate in shorten_text_for_fit(text):
+                if candidate not in fit_attempts:
+                    fit_attempts.append(candidate)
+
+        for candidate in fit_attempts:
+            fits, size, width, height = self._fit_single_text(candidate, avail_w, avail_h)
+            if fits:
+                return candidate, size, width, height
+
+        # 最後の手段。最小サイズで 3 桁固定表現。
+        fallback = "###"
+        fits, size, width, height = self._fit_single_text(fallback, avail_w, avail_h)
+        if fits:
+            return fallback, size, width, height
+        return fallback, MIN_VALUE_FONT_SIZE, width, height
 
     def render_value(self, bed: str, vital: str, candidates: list[str]):
         canvas = self.value_canvases[(bed, vital)]
@@ -291,16 +321,37 @@ class MonitorApp:
         canvas.update_idletasks()
         c_w = max(canvas.winfo_width(), 1)
         c_h = max(canvas.winfo_height(), 1)
-        avail_w = max(c_w - (self.value_pad_x * 2), 1)
-        avail_h = max(c_h - (self.value_pad_y * 2), 1)
+        left = 0
+        top = 0
+        right = c_w
+        bottom = c_h
+        avail_w = max(c_w - (self.value_pad_left + self.value_pad_right), 1)
+        avail_h = max(c_h - (self.value_pad_top + self.value_pad_bottom), 1)
 
-        text, size = self.fit_text_to_box(candidates, avail_w, avail_h)
+        text, size, text_w, text_h = self.fit_text_to_box(candidates, avail_w, avail_h)
 
-        # 右寄せ時にxがセル外にならないようクランプ。
-        x = max(c_w - self.value_pad_x, self.value_pad_x)
-        y = max(c_h - self.value_pad_y, self.value_pad_y)
+        # 右寄せ: 右端 - pad_right - width。必ずセル内へ clamp。
+        x = right - self.value_pad_right - text_w
+        min_x = left + self.value_pad_left
+        max_x = max(min_x, right - self.value_pad_right - text_w)
+        x = min(max(x, min_x), max_x)
+
+        # 縦位置もセル内へ clamp。
+        y = bottom - self.value_pad_bottom - text_h
+        min_y = top + self.value_pad_top
+        max_y = max(min_y, bottom - self.value_pad_bottom - text_h)
+        y = min(max(y, min_y), max_y)
+
+        # デバッグ（右上セルひとつ）
+        if not self.fit_debug_logged and bed == "BED02" and vital == "HR":
+            print(
+                f"[fit-debug] {bed}/{vital}: avail_w={avail_w}, text_width={text_w}, chosen_font_size={size}",
+                flush=True,
+            )
+            self.fit_debug_logged = True
+
         canvas.coords(item_id, x, y)
-        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "bold"), anchor="se")
+        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "bold"), anchor="nw")
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
