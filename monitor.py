@@ -44,7 +44,7 @@ DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 2
-VALUE_Y_FACTOR = 0.48
+VALUE_Y_FACTOR = 0.50
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
