@@ -8,6 +8,7 @@ import socket
 import threading
 import queue
 import time
+import json
 from typing import Optional, Callable
 from pathlib import Path
 import logging
@@ -15,6 +16,43 @@ import logging
 from hl7_parser import HL7Parser, HL7Message
 
 logger = logging.getLogger(__name__)
+
+
+class BedDataAggregator:
+    """ベッド単位で最新バイタルを保持し、JSONキャッシュに保存する。"""
+
+    def __init__(self, cache_path: str = "monitor_cache.json"):
+        self.cache_path = Path(cache_path)
+        self._lock = threading.Lock()
+        self._beds = {}
+
+    def ingest(self, msg: HL7Message):
+        bed_id = msg.bed_id or "UNASSIGNED"
+        vitals = {}
+        for key, vital in msg.vitals.items():
+            vitals[key] = {
+                "value": vital.value,
+                "unit": vital.unit,
+                "flag": vital.abnormal_flag,
+                "status": vital.status,
+            }
+
+        with self._lock:
+            self._beds[bed_id] = {
+                "message_datetime": msg.message_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+                "patient_id": msg.patient_id,
+                "patient_name": msg.patient_name,
+                "bed_id": bed_id,
+                "vitals": vitals,
+            }
+            payload = {
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "beds": self._beds,
+            }
+            self.cache_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
 
 class MLLPProtocol:
@@ -389,17 +427,47 @@ def test_file_watcher():
         watcher.stop()
 
 
+def run_receiver_service(host: str, port: int, cache_path: str):
+    """本番想定の受信・集約サービスを起動する。"""
+    aggregator = BedDataAggregator(cache_path=cache_path)
+
+    def on_message(hl7_msg: HL7Message):
+        aggregator.ingest(hl7_msg)
+        logger.info(
+            "Aggregated bed=%s patient=%s vitals=%d",
+            hl7_msg.bed_id or "UNASSIGNED",
+            hl7_msg.patient_id,
+            len(hl7_msg.vitals),
+        )
+
+    receiver = HL7TCPReceiver(host=host, port=port, callback=on_message)
+    receiver.start()
+    logger.info("HL7 receiver service started. cache=%s", cache_path)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Stopping receiver service...")
+        receiver.stop()
+
+
 if __name__ == "__main__":
     import argparse
     
     logging.basicConfig(level=logging.INFO)
     
-    parser = argparse.ArgumentParser(description='HL7 Receiver Test')
-    parser.add_argument('--mode', choices=['tcp', 'file'], default='tcp',
+    parser = argparse.ArgumentParser(description='HL7 Receiver')
+    parser.add_argument('--mode', choices=['tcp', 'file', 'service'], default='service',
                        help='Receiver mode')
+    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=2575)
+    parser.add_argument('--cache', default='monitor_cache.json')
     args = parser.parse_args()
-    
+
     if args.mode == 'tcp':
         test_tcp_receiver()
+    elif args.mode == 'service':
+        run_receiver_service(args.host, args.port, args.cache)
     else:
         test_file_watcher()

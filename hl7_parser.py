@@ -42,6 +42,7 @@ class HL7Message:
     message_datetime: datetime
     patient_id: str = ""
     patient_name: str = ""
+    bed_id: str = ""
     vitals: Dict[str, HL7VitalSign] = field(default_factory=dict)
     raw_message: str = ""
     
@@ -296,6 +297,27 @@ class HL7Parser:
             observation_time=obs_time,
             status=status
         )
+
+    def parse_pv1(self, fields: List[str]) -> str:
+        """
+        PV1セグメント解析
+
+        PV1-3(Assigned Patient Location) をベッド識別子として使用する。
+        例: PV1|1|I|ICU^01^BED01
+        """
+        if len(fields) <= 3:
+            return ""
+
+        location = self.split_component(fields[3])
+        if not location:
+            return ""
+
+        # HL7のlocation要素(病棟^部屋^ベッド)のうち、ベッドを優先
+        if len(location) >= 3 and location[2]:
+            return location[2]
+        if len(location) >= 2 and location[1]:
+            return location[1]
+        return location[0]
     
     def parse(self, hl7_message: str) -> Optional[HL7Message]:
         """
@@ -330,6 +352,7 @@ class HL7Parser:
         message_datetime = datetime.now()
         patient_id = ""
         patient_name = ""
+        bed_id = ""
         vitals = {}
         
         # 各セグメントを解析
@@ -342,11 +365,12 @@ class HL7Parser:
             
             elif segment_type == "PID":
                 patient_id, patient_name = self.parse_pid(fields)
-            
+
+            elif segment_type == "PV1":
+                bed_id = self.parse_pv1(fields)
+
             elif segment_type == "OBX":
-                print("DEBUG OBX segment:", segment)
                 vital = self.parse_obx(fields)
-                print("DEBUG vital:", vital)
                 if vital and vital.observation_name:
                     vitals[vital.observation_name] = vital
 
@@ -356,6 +380,7 @@ class HL7Parser:
             message_datetime=message_datetime,
             patient_id=patient_id,
             patient_name=patient_name,
+            bed_id=bed_id,
             vitals=vitals,
             raw_message=hl7_message
         )
