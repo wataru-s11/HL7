@@ -1,0 +1,25 @@
+# 生体情報モニター画像認識システム - 依存パッケージ
+
+# コアパッケージ
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# OCRエンジン
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+pytesseract>=0.3.10
+
+# 画像処理
+Pillow>=10.0.0
+
+# Google Cloud Vision API（オプション）
+google-cloud-vision>=3.4.0
+
+# データ処理
+pandas>=2.0.0
+
+# 可視化（オプション）
+matplotlib>=3.7.0
+
+# ユーティリティ
+python-dateutil>=2.8.0
