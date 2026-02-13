@@ -1,122 +1,111 @@
 #!/usr/bin/env python3
-"""固定レイアウトの6ベッドモニタGUI。"""
+"""
+固定レイアウトのモニタGUI。
+hl7_receiver.py が出力する monitor_cache.json を監視表示する。
+OCR前提: 白背景・黒文字・桁固定(等幅フォント)。
+"""
 
+from __future__ import annotations
+
+import argparse
 import json
-import sys
-from datetime import datetime, timezone
 from pathlib import Path
-
-from PySide6.QtCore import QTimer
-from PySide6.QtGui import QColor, QFont, QPalette
-from PySide6.QtWidgets import QApplication, QGridLayout, QLabel, QMainWindow, QWidget
-
-VITAL_ORDER = [
-    "HR", "ART_S", "ART_D", "ART_M", "CVP_M", "RAP_M", "SpO2", "TSKIN", "TRECT", "rRESP",
-    "EtCO2", "RR", "VTe", "VTi", "Ppeak", "PEEP", "O2conc", "NO", "BSR1", "BSR2",
-]
-
-FORMATTERS = {
-    "HR": "{:03.0f}", "ART_S": "{:03.0f}", "ART_D": "{:03.0f}", "ART_M": "{:03.0f}",
-    "CVP_M": "{:02.0f}", "RAP_M": "{:02.0f}", "SpO2": "{:03.0f}", "TSKIN": "{:04.1f}",
-    "TRECT": "{:04.1f}", "rRESP": "{:03.0f}", "EtCO2": "{:03.0f}", "RR": "{:03.0f}",
-    "VTe": "{:03.0f}", "VTi": "{:03.0f}", "Ppeak": "{:02.0f}", "PEEP": "{:02.0f}",
-    "O2conc": "{:03.0f}", "NO": "{:02.0f}", "BSR1": "{:03.0f}", "BSR2": "{:03.0f}",
-}
+import tkinter as tk
+from tkinter import font
 
 
-class MonitorWindow(QMainWindow):
-    def __init__(self, latest_file: str = "latest.json"):
-        super().__init__()
-        self.latest_file = Path(latest_file)
-        self.beds = [f"BED{i:02d}" for i in range(1, 7)]
-        self.value_labels = {}
+BED_IDS = [f"BED0{i}" for i in range(1, 7)]
+VITAL_ORDER = ["HR", "SpO2", "NIBP_SYS", "NIBP_DIA", "RR", "TEMP"]
 
-        self.setWindowTitle("ICU Monitor")
-        self.resize(1600, 700)
 
-        palette = self.palette()
-        palette.setColor(QPalette.Window, QColor("white"))
-        palette.setColor(QPalette.WindowText, QColor("black"))
-        self.setPalette(palette)
+def format_value(value) -> str:
+    if value is None:
+        return "----"
+    if isinstance(value, float):
+        return f"{value:>4.1f}"
+    return f"{int(value):>4d}" if isinstance(value, int) else f"{str(value):>4}"
 
-        central = QWidget()
-        grid = QGridLayout(central)
-        mono = QFont("Courier New", 11)
-        mono.setStyleHint(QFont.Monospace)
 
-        header = QLabel("ITEM")
-        header.setFont(mono)
-        grid.addWidget(header, 0, 0)
+class MonitorApp:
+    def __init__(self, cache_path: Path, refresh_ms: int = 1000):
+        self.cache_path = cache_path
+        self.refresh_ms = refresh_ms
 
-        for col, bed in enumerate(self.beds, start=1):
-            label = QLabel(bed)
-            label.setFont(mono)
-            grid.addWidget(label, 0, col)
+        self.root = tk.Tk()
+        self.root.title("HL7 Bed Monitor")
+        self.root.configure(bg="white")
 
-        for row, vital in enumerate(VITAL_ORDER, start=1):
-            item = QLabel(vital)
-            item.setFont(mono)
-            grid.addWidget(item, row, 0)
-            for col, bed in enumerate(self.beds, start=1):
-                value_label = QLabel("NA")
-                value_label.setFont(mono)
-                value_label.setMinimumWidth(90)
-                grid.addWidget(value_label, row, col)
-                self.value_labels[(bed, vital)] = value_label
+        mono = font.Font(family="Consolas", size=14)
+        title_font = font.Font(family="Consolas", size=16, weight="bold")
 
-        self.setCentralWidget(central)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh)
-        self.timer.start(1000)
-        self.refresh()
+        header = tk.Label(
+            self.root,
+            text="HL7 MONITOR (Fixed Layout)",
+            bg="white",
+            fg="black",
+            font=title_font,
+        )
+        header.grid(row=0, column=0, columnspan=7, sticky="w", padx=12, pady=8)
+
+        tk.Label(self.root, text="BED", bg="white", fg="black", font=mono).grid(row=1, column=0, padx=8)
+        for idx, vital in enumerate(VITAL_ORDER, start=1):
+            tk.Label(self.root, text=f"{vital:>8}", bg="white", fg="black", font=mono).grid(
+                row=1, column=idx, padx=8
+            )
+
+        self.cells: dict[tuple[str, str], tk.Label] = {}
+        for row_idx, bed in enumerate(BED_IDS, start=2):
+            tk.Label(self.root, text=f"{bed:>6}", bg="white", fg="black", font=mono).grid(
+                row=row_idx, column=0, padx=8, pady=4
+            )
+            for col_idx, vital in enumerate(VITAL_ORDER, start=1):
+                lbl = tk.Label(
+                    self.root,
+                    text="----    ",
+                    width=8,
+                    anchor="e",
+                    bg="white",
+                    fg="black",
+                    font=mono,
+                )
+                lbl.grid(row=row_idx, column=col_idx, padx=8, pady=4)
+                self.cells[(bed, vital)] = lbl
+
+    def load_cache(self) -> dict:
+        if not self.cache_path.exists():
+            return {}
+        try:
+            with self.cache_path.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return {}
 
     def refresh(self):
-        now = datetime.now(timezone.utc)
-        data = {}
-        if self.latest_file.exists():
-            try:
-                data = json.loads(self.latest_file.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                data = {}
+        payload = self.load_cache()
+        beds = payload.get("beds", {}) if isinstance(payload, dict) else {}
 
-        for bed in self.beds:
-            bed_data = data.get(bed, {})
+        for bed in BED_IDS:
+            row = beds.get(bed, {})
+            vitals = row.get("vitals", {}) if isinstance(row, dict) else {}
             for vital in VITAL_ORDER:
-                label = self.value_labels[(bed, vital)]
-                entry = bed_data.get(vital)
-                if not entry:
-                    label.setText("NA")
-                    label.setStyleSheet("color: gray;")
-                    continue
+                value = vitals.get(vital, {}).get("value") if isinstance(vitals.get(vital), dict) else None
+                self.cells[(bed, vital)].configure(text=f"{format_value(value):>8}")
 
-                ts = entry.get("time")
-                stale = True
-                if ts:
-                    try:
-                        dt = datetime.fromisoformat(ts)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        stale = (now - dt).total_seconds() > 20
-                    except ValueError:
-                        stale = True
+        self.root.after(self.refresh_ms, self.refresh)
 
-                value = entry.get("value")
-                if value is None:
-                    txt = "NA"
-                else:
-                    fmt = FORMATTERS.get(vital, "{}")
-                    txt = fmt.format(value)
-                label.setText(txt)
-                label.setStyleSheet("color: gray;" if stale else "color: black;")
+    def run(self):
+        self.refresh()
+        self.root.mainloop()
 
 
-def main():
-    latest_file = sys.argv[1] if len(sys.argv) > 1 else "latest.json"
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = MonitorWindow(latest_file=latest_file)
-    win.show()
-    sys.exit(app.exec())
+def main() -> None:
+    parser = argparse.ArgumentParser(description="HL7 monitor GUI")
+    parser.add_argument("--cache", default="monitor_cache.json")
+    parser.add_argument("--refresh-ms", type=int, default=1000)
+    args = parser.parse_args()
+
+    app = MonitorApp(Path(args.cache), refresh_ms=args.refresh_ms)
+    app.run()
 
 
 if __name__ == "__main__":

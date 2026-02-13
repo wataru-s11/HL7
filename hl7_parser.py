@@ -180,6 +180,27 @@ class HL7Parser:
             status=status,
         )
 
+    def parse_pv1(self, fields: List[str]) -> str:
+        """
+        PV1セグメント解析
+
+        PV1-3(Assigned Patient Location) をベッド識別子として使用する。
+        例: PV1|1|I|ICU^01^BED01
+        """
+        if len(fields) <= 3:
+            return ""
+
+        location = self.split_component(fields[3])
+        if not location:
+            return ""
+
+        # HL7のlocation要素(病棟^部屋^ベッド)のうち、ベッドを優先
+        if len(location) >= 3 and location[2]:
+            return location[2]
+        if len(location) >= 2 and location[1]:
+            return location[1]
+        return location[0]
+    
     def parse(self, hl7_message: str) -> Optional[HL7Message]:
         if not hl7_message:
             return None
@@ -202,8 +223,10 @@ class HL7Parser:
                 message_type, message_datetime = self.parse_msh(fields)
             elif segment_type == "PID":
                 patient_id, patient_name = self.parse_pid(fields)
+
             elif segment_type == "PV1":
-                bed_id = self.parse_pv1_bed(fields)
+                bed_id = self.parse_pv1(fields)
+
             elif segment_type == "OBX":
                 vital = self.parse_obx(fields)
                 if vital and vital.observation_name:
