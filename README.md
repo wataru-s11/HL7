@@ -28,14 +28,15 @@
 
 ## モニタ表示仕様（OCR前提）
 
-- 6ベッド（`BED01`〜`BED06`）を縦並びで表示
+- 画面サイズは **1920x1080固定**（スクロールなし・はみ出しなし）
+- 6ベッド（`BED01`〜`BED06`）を **2列×3行** で固定表示
 - 1ベッドあたり **4列×5行 = 20セル** の固定配置（位置が変動しない）
 - 表示項目（固定順）:
   `HR, ART_S, ART_D, ART_M, CVP_M, RAP_M, SpO2, TSKIN, TRECT, rRESP, EtCO2, RR, VTe, VTi, Ppeak, PEEP, O2conc, NO, BSR1, BSR2`
 - 白背景・黒文字
-- 値フォントは48px（Consolas等幅）、ラベルは18px
+- 値フォントは40px（Consolas等幅）、ラベルは16px
 - `--refresh-ms` でJSON再読込周期を指定
-- `--stale-seconds` 秒以上更新がないベッドは `NA` 表示（桁幅固定）
+- `--stale-sec`（互換: `--stale-seconds`）秒以上更新がないベッドは `NA` 表示（既定30秒、桁幅固定）
 - JSONファイルが欠損/壊れ/更新途中でも表示は維持（直前の正常表示を継続）
 - 各ベッドに `last: HH:MM:SS`（最終更新時刻）を小さく表示
 
@@ -67,7 +68,7 @@ python hl7_receiver.py --mode service --host 0.0.0.0 --port 2575 --cache monitor
 別ターミナルで:
 
 ```powershell
-python monitor.py --cache monitor_cache.json --refresh-ms 1000 --stale-seconds 15
+python monitor.py --cache monitor_cache.json --refresh-ms 1000 --stale-sec 30
 ```
 
 ### 3) 仮想セントラル起動（検証時のみ）
@@ -96,3 +97,22 @@ python generator.py --enabled false
 - `hl7_receiver.py`: MLLP受信、HL7パース、ベッド単位JSONキャッシュ作成
 - `hl7_parser.py`: ORU^R01、`PV1-3`、OBXバイタル抽出
 - `monitor.py`: OCR前提の固定レイアウト表示（6ベッド×20項目）
+
+
+## 動作確認例（generator 10秒更新）
+
+```powershell
+# terminal-1
+python hl7_receiver.py --mode service --host 0.0.0.0 --port 2575 --cache monitor_cache.json
+
+# terminal-2
+python monitor.py --cache monitor_cache.json --refresh-ms 1000 --stale-sec 30
+
+# terminal-3
+python generator.py --host 127.0.0.1 --port 2575 --interval 10
+```
+
+確認ポイント:
+- 6ベッドが FullHD 1画面内に収まる
+- 各ベッドは 4x5 の固定セルで値更新時も位置不変
+- 10秒ごとに値が更新されても `NA` がチラつかない

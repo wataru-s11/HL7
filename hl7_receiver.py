@@ -4,12 +4,11 @@
 import argparse
 import json
 import logging
+import os
 import queue
 import socket
 import threading
 import time
-import json
-from typing import Optional, Callable
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -17,6 +16,12 @@ from hl7_parser import HL7Message, HL7Parser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 class BedDataAggregator:
@@ -50,10 +55,7 @@ class BedDataAggregator:
                 "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "beds": self._beds,
             }
-            self.cache_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            atomic_write_json(self.cache_path, payload)
 
 
 class MLLPProtocol:
@@ -92,7 +94,7 @@ class LatestStore:
                     "unit": vital.unit,
                     "time": ts.isoformat(),
                 }
-            self.latest_file.write_text(json.dumps(self.latest, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_json(self.latest_file, self.latest)
 
 
 class HL7TCPReceiver:
