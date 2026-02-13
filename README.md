@@ -20,9 +20,24 @@
 `generator.py` はあくまで**テスト用の送信元**で、受信側は送信元に依存しません。
 本番では generator を停止し、実機セントラルから同じ ORU^R01 を送ればそのまま動作します。
 
-1. `generator.py` が6ベッド分の ORU^R01 を1分毎に送信
+1. `generator.py` が6ベッド分の ORU^R01 を送信
 2. `hl7_receiver.py` がMLLP受信し、`PV1-3` のベッドIDで最新データを集約
-3. `monitor.py` が `monitor_cache.json` を読み取り表示
+3. `monitor.py` が `monitor_cache.json` を定期再読込して表示
+
+---
+
+## モニタ表示仕様（OCR前提）
+
+- 6ベッド（`BED01`〜`BED06`）を縦並びで表示
+- 1ベッドあたり **4列×5行 = 20セル** の固定配置（位置が変動しない）
+- 表示項目（固定順）:
+  `HR, ART_S, ART_D, ART_M, CVP_M, RAP_M, SpO2, TSKIN, TRECT, rRESP, EtCO2, RR, VTe, VTi, Ppeak, PEEP, O2conc, NO, BSR1, BSR2`
+- 白背景・黒文字
+- 値フォントは48px（Consolas等幅）、ラベルは18px
+- `--refresh-ms` でJSON再読込周期を指定
+- `--stale-seconds` 秒以上更新がないベッドは `NA` 表示（桁幅固定）
+- JSONファイルが欠損/壊れ/更新途中でも表示は維持（直前の正常表示を継続）
+- 各ベッドに `last: HH:MM:SS`（最終更新時刻）を小さく表示
 
 ---
 
@@ -52,7 +67,7 @@ python hl7_receiver.py --mode service --host 0.0.0.0 --port 2575 --cache monitor
 別ターミナルで:
 
 ```powershell
-python monitor.py --cache monitor_cache.json --refresh-ms 1000
+python monitor.py --cache monitor_cache.json --refresh-ms 1000 --stale-seconds 15
 ```
 
 ### 3) 仮想セントラル起動（検証時のみ）
@@ -60,7 +75,7 @@ python monitor.py --cache monitor_cache.json --refresh-ms 1000
 別ターミナルで:
 
 ```powershell
-python generator.py --host 127.0.0.1 --port 2575 --interval 60 --enabled true
+python generator.py --host 127.0.0.1 --port 2575 --interval 10 --count 3
 ```
 
 ---
@@ -80,5 +95,4 @@ python generator.py --enabled false
 - `generator.py`: 6ベッドのランダムバイタル ORU^R01 を生成・送信
 - `hl7_receiver.py`: MLLP受信、HL7パース、ベッド単位JSONキャッシュ作成
 - `hl7_parser.py`: ORU^R01、`PV1-3`、OBXバイタル抽出
-- `monitor.py`: OCR前提の固定レイアウト表示
-
+- `monitor.py`: OCR前提の固定レイアウト表示（6ベッド×20項目）
