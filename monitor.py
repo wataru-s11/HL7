@@ -44,6 +44,7 @@ DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 2
+VALUE_Y_FACTOR = 0.50
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -392,13 +393,9 @@ class MonitorApp:
         max_x = max(min_x, right - right_inset)
         x = min(max(x, min_x), max_x)
 
-        center_y = (value_top + value_bottom) / 2.0
-        min_y = value_top + self.value_pad_top + (text_h / 2.0) + CELL_BORDER_MARGIN
-        max_y = value_bottom - self.value_pad_bottom - (text_h / 2.0) - CELL_BORDER_MARGIN
-        if max_y < min_y:
-            y = center_y
-        else:
-            y = min(max(center_y, min_y), max_y)
+        # 下寄せで欠けるのを防ぐため、y は常にセル中央基準で配置する。
+        # 必要に応じて VALUE_Y_FACTOR を 0.48〜0.52 の範囲で微調整する。
+        y = value_top + (value_bottom - value_top) * VALUE_Y_FACTOR
 
         # デバッグ（右上セルひとつ）
         if not self.fit_debug_logged and bed == "BED01" and vital == "HR":
