@@ -46,6 +46,9 @@ def wrap_mllp(message: str) -> bytes:
     return START_BLOCK + message.encode("utf-8") + END_BLOCK + CARRIAGE_RETURN
 
 
+TEMP_VITALS = {"TSKIN", "TRECT"}
+
+
 VITAL_SPECS: Dict[str, Tuple[str, str, str]] = {
     "HR": ("bpm", "60-160", "int"),
     "ART_S": ("mmHg", "70-140", "int"),
@@ -102,9 +105,9 @@ def make_oru_r01(profile: BedProfile) -> str:
 
     obx_segments = []
     for idx, key in enumerate(VITAL_SPECS.keys(), start=1):
-        unit, ref_range, value_type = VITAL_SPECS[key]
+        unit, ref_range, _value_type = VITAL_SPECS[key]
         value = v[key]
-        value_text = f"{value:.1f}" if value_type == "float" else str(int(value))
+        value_text = f"{float(value):.1f}" if key in TEMP_VITALS else str(int(value))
         obx_segments.append(
             f"OBX|{idx}|NM|{key}^{key}||{value_text}|{unit}|{ref_range}|N|||F|{ts}||"
         )
