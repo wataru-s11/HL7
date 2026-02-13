@@ -38,6 +38,7 @@
 - `--refresh-ms` でJSON再読込周期を指定
 - `--stale-sec`（互換: `--stale-seconds`）秒以上更新がないベッドは `NA` 表示（既定30秒、桁幅固定）
 - JSONファイルが欠損/壊れ/更新途中でも表示は維持（直前の正常表示を継続）
+- `hl7_receiver.py` のJSON出力は `monitor_cache.json.tmp` へ一時書込後に `os.replace` で原子的に差し替え
 - 各ベッドに `last: HH:MM:SS`（最終更新時刻）を小さく表示
 
 ---
