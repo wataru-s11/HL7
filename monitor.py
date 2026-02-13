@@ -44,6 +44,8 @@ DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 2
+LABEL_SAFE_PAD_X = 4
+LABEL_SAFE_PAD_Y = 6
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -210,7 +212,7 @@ class MonitorApp:
                     anchor="se",
                     justify="right",
                 )
-                value_label.pack(fill="both", expand=True, padx=2, pady=0)
+                value_label.pack(fill="both", expand=True, padx=6, pady=2)
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
@@ -369,6 +371,8 @@ class MonitorApp:
 
         avail_w = max(label_w - (left_inset + right_inset), 1)
         avail_h = max(label_h - (top_inset + bottom_inset), 1)
+        avail_w = max(avail_w - (LABEL_SAFE_PAD_X * 2), 1)
+        avail_h = max(avail_h - (LABEL_SAFE_PAD_Y * 2), 1)
 
         is_temp_vital = vital in DEC1_VITALS
         text, size, _, _ = self.fit_text_to_box(
