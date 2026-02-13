@@ -46,6 +46,7 @@ INT_VITALS = {
 }
 DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
+MISSING_PLACEHOLDER = "...."
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -59,13 +60,13 @@ def parse_timestamp(ts: str | None) -> datetime | None:
     return None
 
 
-def format_value_candidates(vital: str, value, stale: bool) -> list[str]:
-    if stale or value is None:
-        return ["NA"]
+def format_value_candidates(vital: str, value) -> list[str]:
+    if value is None:
+        return [MISSING_PLACEHOLDER]
     try:
         num = float(value)
     except (TypeError, ValueError):
-        return ["NA"]
+        return [MISSING_PLACEHOLDER]
 
     if vital in DEC1_VITALS:
         # 温度は 34.5 表記を維持（ゼロ埋めなし）
@@ -87,16 +88,13 @@ def shorten_text_for_fit(text: str) -> list[str]:
     if num is not None and "." in str(text):
         candidates.append(str(int(round(num))))
 
-    # 要件: それでも入らない場合は 3 桁に丸める/クリップしない。
+    # 要件: それでも入らない場合は整数化し、3〜4文字程度に短縮。
     if num is not None:
         rounded = int(round(num))
-        clipped = max(min(rounded, 999), -99)
-        if clipped < 0:
-            candidates.append(f"-{abs(clipped):02d}")
-        else:
-            candidates.append(f"{clipped:03d}")
-    else:
-        candidates.append("###")
+        reduced = str(rounded)
+        if len(reduced) > 4:
+            reduced = reduced[:4]
+        candidates.append(reduced)
 
     uniq: list[str] = []
     for c in candidates:
@@ -122,8 +120,8 @@ class MonitorApp:
 
         self.title_font = font.Font(family="Consolas", size=20, weight="bold")
         self.label_font = font.Font(family="Consolas", size=16, weight="bold")
-        self.value_font = font.Font(family="Consolas", size=40, weight="bold")
-        self.value_measure_font = font.Font(family="Consolas", size=40, weight="bold")
+        self.value_font = font.Font(family="Consolas", size=40, weight="normal")
+        self.value_measure_font = font.Font(family="Consolas", size=40, weight="normal")
         self.time_font = font.Font(family="Consolas", size=12)
 
         self.safe_top = 8
@@ -307,11 +305,11 @@ class MonitorApp:
             if fits:
                 return candidate, size, width, height
 
-        # 最後の手段。最小サイズで 3 桁固定表現。
-        fallback = "###"
-        fits, size, width, height = self._fit_single_text(fallback, avail_w, avail_h)
-        if fits:
-            return fallback, size, width, height
+        # 最終手段: 最後の候補を最小フォントで強制表示（値がある限り数値表示を維持）。
+        fallback = fit_attempts[-1] if fit_attempts else "0"
+        self.value_measure_font.configure(size=MIN_VALUE_FONT_SIZE)
+        width = int(self.value_measure_font.measure(fallback))
+        height = int(self.value_measure_font.metrics("ascent")) + int(self.value_measure_font.metrics("descent"))
         return fallback, MIN_VALUE_FONT_SIZE, width, height
 
     def render_value(self, bed: str, vital: str, candidates: list[str]):
@@ -343,15 +341,15 @@ class MonitorApp:
         y = min(max(y, min_y), max_y)
 
         # デバッグ（右上セルひとつ）
-        if not self.fit_debug_logged and bed == "BED02" and vital == "HR":
+        if not self.fit_debug_logged and bed == "BED01" and vital == "HR":
             print(
-                f"[fit-debug] {bed}/{vital}: avail_w={avail_w}, text_width={text_w}, chosen_font_size={size}",
+                f"[fit-debug] {bed}/{vital}: text={text}, avail_w={avail_w}, measured_w={text_w}, chosen_font_size={size}",
                 flush=True,
             )
             self.fit_debug_logged = True
 
         canvas.coords(item_id, x, y)
-        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "bold"), anchor="nw")
+        canvas.itemconfigure(item_id, text=text, font=("Consolas", size, "normal"), anchor="nw")
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
@@ -375,8 +373,6 @@ class MonitorApp:
                 self.last_bed_stamp[bed] = bed_stamp
                 self.last_bed_seen_at[bed] = now
 
-            stale = (now - self.last_bed_seen_at[bed]) > self.stale_seconds if self.last_bed_seen_at[bed] else True
-
             dt = parse_timestamp(self.last_bed_stamp[bed])
             ts_label = dt.strftime("%H:%M:%S") if dt else "--:--:--"
             self.updated_labels[bed].configure(text=f"last: {ts_label}")
@@ -384,7 +380,7 @@ class MonitorApp:
             for vital in VITAL_ORDER:
                 vital_obj = vitals.get(vital) if isinstance(vitals.get(vital), dict) else None
                 value = vital_obj.get("value") if vital_obj else None
-                candidates = format_value_candidates(vital, value, stale)
+                candidates = format_value_candidates(vital, value)
                 self.render_value(bed, vital, candidates)
 
     def refresh(self):
