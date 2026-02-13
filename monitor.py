@@ -88,10 +88,10 @@ class MonitorApp:
         self.root.geometry("1920x1080")
         self.root.minsize(1280, 760)
 
-        title_font = font.Font(family="Consolas", size=20, weight="bold")
-        label_font = font.Font(family="Consolas", size=16, weight="bold")
-        value_font = font.Font(family="Consolas", size=40, weight="bold")
-        time_font = font.Font(family="Consolas", size=12)
+        self.title_font = font.Font(family="Consolas", size=20, weight="bold")
+        self.label_font = font.Font(family="Consolas", size=16, weight="bold")
+        self.value_font = font.Font(family="Consolas", size=40, weight="bold")
+        self.time_font = font.Font(family="Consolas", size=12)
 
         self.safe_top = 8
         self.safe_bottom = 16
@@ -106,7 +106,7 @@ class MonitorApp:
             text="HL7 MONITOR (Fixed Layout 4x5 / Bed)",
             bg="white",
             fg="black",
-            font=title_font,
+            font=self.title_font,
             anchor="w",
         )
         self.header.place(x=12, y=4, width=1896, height=40)
@@ -118,6 +118,7 @@ class MonitorApp:
         self.updated_labels: dict[str, tk.Label] = {}
         self.bed_frames: dict[str, tk.Frame] = {}
         self.cell_frames: list[tk.Frame] = []
+        self.vital_name_labels: list[tk.Label] = []
 
         for i, bed in enumerate(BED_IDS):
             bed_frame = tk.Frame(self.body, bg="white", bd=2, relief="solid")
@@ -128,7 +129,7 @@ class MonitorApp:
                 text=bed,
                 bg="white",
                 fg="black",
-                font=title_font,
+                font=self.title_font,
                 anchor="w",
             ).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 0))
 
@@ -137,7 +138,7 @@ class MonitorApp:
                 text="last: --:--:--",
                 bg="white",
                 fg="black",
-                font=time_font,
+                font=self.time_font,
                 anchor="w",
             )
             updated_lbl.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 2))
@@ -155,9 +156,12 @@ class MonitorApp:
                 cell.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
                 self.cell_frames.append(cell)
 
-                tk.Label(cell, text=vital, bg="white", fg="black", font=label_font, anchor="w").place(x=5, y=0)
-                value_lbl = tk.Label(cell, text=" NA ", bg="white", fg="black", font=value_font, anchor="e")
-                value_lbl.place(x=2, y=8, relwidth=1.0, width=-4, height=40)
+                name_lbl = tk.Label(cell, text=vital, bg="white", fg="black", font=self.label_font, anchor="w")
+                name_lbl.pack(anchor="nw", padx=5, pady=(0, 0))
+                self.vital_name_labels.append(name_lbl)
+
+                value_lbl = tk.Label(cell, text=" NA ", bg="white", fg="black", font=self.value_font, anchor="se")
+                value_lbl.pack(fill="both", expand=True, padx=2, pady=(0, 4))
                 self.cells[(bed, vital)] = value_lbl
 
         self.root.update_idletasks()
@@ -190,6 +194,31 @@ class MonitorApp:
 
         bed_w = max((body_w - col_gap) // 2, 1)
         bed_h = max((body_h - (2 * row_gap)) // 3, 1)
+        cell_h = max(bed_h / 5.0, 1.0)
+
+        # DPIスケーリング時の安全マージン5%と下端4pxを常に確保して、
+        # ascent/descentを含む行高がセル高を超えないよう最終調整する。
+        safe_cell_h = max(int(cell_h * 0.95), 1)
+        value_available_h = max(safe_cell_h - 4, 1)
+        value_font_size = max(int(cell_h * 0.75), 8)
+        while value_font_size > 6:
+            self.value_font.configure(size=value_font_size)
+            metrics = self.value_font.metrics()
+            line_h = int(metrics.get("ascent", 0)) + int(metrics.get("descent", 0))
+            if line_h <= value_available_h:
+                break
+            value_font_size -= 1
+
+        label_font_size = max(min(int(cell_h * 0.24), value_font_size // 2), 8)
+        time_font_size = max(min(int(cell_h * 0.18), 14), 8)
+        title_font_size = max(min(int(cell_h * 0.26), 22), 12)
+
+        self.label_font.configure(size=label_font_size)
+        self.time_font.configure(size=time_font_size)
+        self.title_font.configure(size=title_font_size)
+
+        for name_lbl in self.vital_name_labels:
+            name_lbl.configure(pady=0)
 
         for i, bed in enumerate(BED_IDS):
             row_idx = i // 2
