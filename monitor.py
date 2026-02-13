@@ -126,7 +126,7 @@ class MonitorApp:
 
         self.safe_top = 8
         self.safe_bottom = 16
-        self.outer_x = 8
+        self.outer_margin = 10
         self.header_h = 40
         self.header_gap = 4
         self.default_col_gap = 8
@@ -139,6 +139,7 @@ class MonitorApp:
         self.value_pad_bottom = self.value_pad_y
         self.max_value_font_size = 40
         self.fit_debug_logged = False
+        self._redrawing = False
 
         self.header = tk.Label(
             self.root,
@@ -150,8 +151,10 @@ class MonitorApp:
         )
         self.header.place(x=12, y=4, width=1896, height=40)
 
-        self.body = tk.Frame(self.root, bg="white")
-        self.body.place(x=0, y=0, width=1, height=1)
+        self.canvas = tk.Canvas(self.root, bg="white", highlightthickness=0, bd=0)
+        self.canvas.place(x=0, y=0, width=1, height=1)
+        self.canvas_w = 1
+        self.canvas_h = 1
 
         self.value_canvases: dict[tuple[str, str], tk.Canvas] = {}
         self.value_items: dict[tuple[str, str], int] = {}
@@ -162,7 +165,7 @@ class MonitorApp:
         self.vital_name_labels: list[tk.Label] = []
 
         for i, bed in enumerate(BED_IDS):
-            bed_frame = tk.Frame(self.body, bg="white", bd=2, relief="solid")
+            bed_frame = tk.Frame(self.canvas, bg="white", bd=2, relief="solid")
             self.bed_frames[bed] = bed_frame
 
             tk.Label(
@@ -210,10 +213,28 @@ class MonitorApp:
         self.root.update_idletasks()
         self.relayout()
         self.root.bind("<Configure>", self.on_configure)
+        self.canvas.bind("<Configure>", self.on_resize)
+        self.root.after(200, self.redraw_all)
 
     def on_configure(self, event):
         if event.widget is self.root:
             self.relayout()
+
+    def on_resize(self, event):
+        if event.widget is self.canvas:
+            self.canvas_w = max(event.width, 1)
+            self.canvas_h = max(event.height, 1)
+            self.redraw_all()
+
+    def redraw_all(self):
+        if self._redrawing:
+            return
+        self._redrawing = True
+        try:
+            self.relayout()
+            self.render_from_payload()
+        finally:
+            self._redrawing = False
 
     def relayout(self):
         self.root.update_idletasks()
@@ -221,22 +242,35 @@ class MonitorApp:
         client_h = max(self.root.winfo_height(), 1)
 
         header_y = self.safe_top
-        header_x = self.outer_x + 4
-        header_w = max(client_w - (self.outer_x * 2) - 8, 1)
+        safe_left = self.outer_margin
+        safe_top = self.outer_margin
+        safe_right = max(client_w - self.outer_margin, safe_left + 1)
+        safe_bottom = max(client_h - self.outer_margin, safe_top + 1)
+        safe_w = max(safe_right - safe_left, 1)
+        safe_h = max(safe_bottom - safe_top, 1)
+
+        header_x = safe_left + 4
+        header_w = max(safe_w - 8, 1)
         self.header.place(x=header_x, y=header_y, width=header_w, height=self.header_h)
 
-        body_x = self.outer_x
-        body_y = header_y + self.header_h + self.header_gap
-        body_w = max(client_w - (self.outer_x * 2), 1)
-        body_h = max(client_h - body_y - self.safe_bottom, 1)
-        self.body.place(x=body_x, y=body_y, width=body_w, height=body_h)
+        body_x = safe_left
+        body_y = safe_top + self.header_h + self.header_gap
+        body_w = safe_w
+        body_h = max(safe_h - self.header_h - self.header_gap, 1)
+        self.canvas.place(x=body_x, y=body_y, width=body_w, height=body_h)
 
-        col_gap = self.default_col_gap if body_w >= 1800 else 4
-        row_gap = self.default_row_gap if body_h >= 1000 else 3
-        cell_gap = 2 if min(body_w, body_h) >= 900 else 1
+        self.canvas.update_idletasks()
+        W = max(self.canvas.winfo_width(), 1)
+        H = max(self.canvas.winfo_height(), 1)
+        self.canvas_w = W
+        self.canvas_h = H
 
-        bed_w = max((body_w - col_gap) // 2, 1)
-        bed_h = max((body_h - (2 * row_gap)) // 3, 1)
+        col_gap = self.default_col_gap if W >= 1800 else 4
+        row_gap = self.default_row_gap if H >= 1000 else 3
+        cell_gap = 2 if min(W, H) >= 900 else 1
+
+        bed_w = max((W - col_gap) // 2, 1)
+        bed_h = max((H - (2 * row_gap)) // 3, 1)
         cell_h = max(bed_h / 5.0, 1.0)
 
         safe_cell_h = max(int(cell_h * 0.95), 1)
@@ -272,8 +306,6 @@ class MonitorApp:
 
         for cell in self.cell_frames:
             cell.grid_configure(padx=cell_gap, pady=cell_gap)
-
-        self.render_from_payload()
 
     def _fit_single_text(self, text: str, avail_w: int, avail_h: int) -> tuple[bool, int, int, int]:
         start_size = int(min(avail_h * 0.85 + 3, 48))
