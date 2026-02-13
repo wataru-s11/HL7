@@ -19,9 +19,37 @@ logger = logging.getLogger(__name__)
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp_path, path)
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    pid = os.getpid()
+    thread_id = threading.get_ident()
+    tmp_path = path.with_name(f"{path.name}.{pid}.{thread_id}.tmp")
+
+    try:
+        tmp_path.write_text(data, encoding="utf-8")
+    except Exception:
+        logger.exception("failed to write temp cache file: %s", tmp_path)
+        return
+
+    for _ in range(20):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+        except Exception:
+            logger.exception("failed to replace cache file: %s", path)
+            break
+
+    try:
+        path.write_text(data, encoding="utf-8")
+    except Exception:
+        logger.exception("failed to write cache file fallback: %s", path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 class BedDataAggregator:
