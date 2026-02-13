@@ -74,7 +74,7 @@ def format_value(vital: str, value, stale: bool) -> str:
 
 
 class MonitorApp:
-    def __init__(self, cache_path: Path, refresh_ms: int = 1000, stale_seconds: int = 15):
+    def __init__(self, cache_path: Path, refresh_ms: int = 1000, stale_seconds: int = 30):
         self.cache_path = cache_path
         self.refresh_ms = refresh_ms
         self.stale_seconds = stale_seconds
@@ -85,10 +85,12 @@ class MonitorApp:
         self.root = tk.Tk()
         self.root.title("HL7 Bed Monitor")
         self.root.configure(bg="white")
+        self.root.geometry("1920x1080")
+        self.root.resizable(False, False)
 
         title_font = font.Font(family="Consolas", size=20, weight="bold")
-        label_font = font.Font(family="Consolas", size=18, weight="bold")
-        value_font = font.Font(family="Consolas", size=48, weight="bold")
+        label_font = font.Font(family="Consolas", size=16, weight="bold")
+        value_font = font.Font(family="Consolas", size=40, weight="bold")
         time_font = font.Font(family="Consolas", size=12)
 
         header = tk.Label(
@@ -99,14 +101,27 @@ class MonitorApp:
             font=title_font,
             anchor="w",
         )
-        header.pack(fill="x", padx=16, pady=(8, 12))
+        header.pack(fill="x", padx=12, pady=(4, 4))
+
+        body = tk.Frame(self.root, bg="white", width=1920, height=1040)
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        body.pack_propagate(False)
+
+        for r in range(3):
+            body.grid_rowconfigure(r, minsize=340, weight=0)
+        for c in range(2):
+            body.grid_columnconfigure(c, minsize=952, weight=0)
 
         self.cells: dict[tuple[str, str], tk.Label] = {}
         self.updated_labels: dict[str, tk.Label] = {}
 
-        for bed in BED_IDS:
-            bed_frame = tk.Frame(self.root, bg="white", bd=2, relief="solid")
-            bed_frame.pack(fill="x", padx=14, pady=8)
+        for i, bed in enumerate(BED_IDS):
+            row_idx = i // 2
+            col_idx = i % 2
+
+            bed_frame = tk.Frame(body, bg="white", bd=2, relief="solid", width=944, height=334)
+            bed_frame.grid(row=row_idx, column=col_idx, padx=4, pady=3)
+            bed_frame.grid_propagate(False)
 
             tk.Label(
                 bed_frame,
@@ -115,7 +130,7 @@ class MonitorApp:
                 fg="black",
                 font=title_font,
                 anchor="w",
-            ).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(6, 0))
+            ).grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 0))
 
             updated_lbl = tk.Label(
                 bed_frame,
@@ -125,22 +140,22 @@ class MonitorApp:
                 font=time_font,
                 anchor="w",
             )
-            updated_lbl.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+            updated_lbl.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 2))
             self.updated_labels[bed] = updated_lbl
 
             for c in range(4):
-                bed_frame.grid_columnconfigure(c, minsize=360, weight=0)
+                bed_frame.grid_columnconfigure(c, minsize=231, weight=0)
 
             for i, vital in enumerate(VITAL_ORDER):
                 row = 2 + (i // 4)
                 col = i % 4
-                cell = tk.Frame(bed_frame, bg="white", bd=1, relief="solid", width=350, height=110)
-                cell.grid(row=row, column=col, padx=6, pady=6)
+                cell = tk.Frame(bed_frame, bg="white", bd=1, relief="solid", width=223, height=50)
+                cell.grid(row=row, column=col, padx=2, pady=2)
                 cell.grid_propagate(False)
 
-                tk.Label(cell, text=vital, bg="white", fg="black", font=label_font, anchor="w").place(x=8, y=6)
+                tk.Label(cell, text=vital, bg="white", fg="black", font=label_font, anchor="w").place(x=5, y=0)
                 value_lbl = tk.Label(cell, text=" NA ", bg="white", fg="black", font=value_font, anchor="e")
-                value_lbl.place(x=8, y=34, width=330, height=66)
+                value_lbl.place(x=2, y=8, width=216, height=40)
                 self.cells[(bed, vital)] = value_lbl
 
     def load_cache(self) -> dict | None:
@@ -191,10 +206,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HL7 monitor GUI")
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--refresh-ms", type=int, default=1000, help="JSON再読込周期(ms)")
-    parser.add_argument("--stale-seconds", type=int, default=15, help="更新停止時にNA化する秒数")
+    parser.add_argument("--stale-sec", "--stale-seconds", dest="stale_sec", type=int, default=30, help="更新停止時にNA化する秒数")
     args = parser.parse_args()
 
-    app = MonitorApp(Path(args.cache), refresh_ms=args.refresh_ms, stale_seconds=args.stale_seconds)
+    app = MonitorApp(Path(args.cache), refresh_ms=args.refresh_ms, stale_seconds=args.stale_sec)
     app.run()
 
 
