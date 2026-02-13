@@ -1,77 +1,84 @@
-# HL7 仮想モニタシステム
+# HL7 仮想モニタ統合システム
 
-## 現在の状態
-- HL7 ORU^R01 メッセージの送信（`hl7_sender.py`）
-- TCP/MLLP 受信（`hl7_receiver.py`）
-- LOINC対応バイタル抽出（`hl7_parser.py`）
-- OCR最優先の固定レイアウトGUI（`monitor.py`）
+院内ネットワーク接続前の事前検証向けに、以下3コンポーネントで構成したシステムです。
 
-## monitor.py（OCR最優先GUI）
+- `generator.py`（仮想セントラル）
+- `hl7_receiver.py`（TCP/MLLP受信 + ベッド単位集約）
+- `monitor.py`（固定レイアウトGUI表示）
 
-### 設計方針
-- **文字サイズを最優先**（値は 44px の等幅フォント）
-- 背景は白（`#FFFFFF`）、文字は黒（`#000000`）
-- フォントは視認性の高いモノスペース（`DejaVu Sans Mono` / `Noto Sans Mono` / `Roboto Mono`）
-- ラベルは小さめ（16px）、数値を主役化
-- 1項目ごとに固定枠（カード）を使用し、値更新時も位置・幅が変化しない
-- 数値は桁固定（ゼロ埋め）
-  - HR: `000`
-  - SpO2: `000`
-  - RR: `00`
-  - TEMP/BT/CO/CI: `00.0`
-  - そのほかも項目ごとに固定桁
-- 更新停止時は `NA` を固定幅で表示し、レイアウト崩れを防止
+要件対応:
+- HL7 v2.x `ORU^R01`
+- TCP/MLLP通信
+- ベッド識別は `PV1-3`
+- GUI固定レイアウト（白背景・黒文字・桁固定）
+- Python 3.11 / Windows想定
 
-### レイアウト
-- 解像度前提: `1920x1080` フルスクリーン
-- ベッド: `BED01`〜`BED06` を縦配置
-- 各ベッド: `4列 × 5行 = 20項目` の固定グリッド
-- 各セル: 「ラベル（上段） + 値（下段）」の2段構成
-- 全ベッドで同一セルサイズ（固定）
+---
 
-> 注: OCR精度優先のため、文字サイズを落として1画面に詰め込む設計は採用しません。
+## アーキテクチャ（実機置換を意識）
 
-### データ更新
-- `latest.json` を監視（ポーリング）
-- JSON更新時は**値のみ**更新し、レイアウトは不変
-- 一定時間（既定 15 秒）更新がなければ `NA` 表示
+`generator.py` はあくまで**テスト用の送信元**で、受信側は送信元に依存しません。
+本番では generator を停止し、実機セントラルから同じ ORU^R01 を送ればそのまま動作します。
 
-### 期待する `latest.json` 形式（例）
-```json
-{
-  "BED01": {
-    "HR": 78,
-    "SpO2": 97,
-    "RR": 18,
-    "TEMP": 36.5
-  },
-  "BED02": {
-    "HR": 65,
-    "SpO2": 99,
-    "RR": 14,
-    "TEMP": 37.0,
-    "timestamp": 1736500000
-  }
-}
+1. `generator.py` が6ベッド分の ORU^R01 を1分毎に送信
+2. `hl7_receiver.py` がMLLP受信し、`PV1-3` のベッドIDで最新データを集約
+3. `monitor.py` が `monitor_cache.json` を読み取り表示
+
+---
+
+## セットアップ（Windows / Python 3.11）
+
+```powershell
+cd C:\path\to\HL7
+py -3.11 -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install --upgrade pip
 ```
 
-### 起動方法
-```bash
-python monitor.py
+> GUIは標準の `tkinter` を利用します（通常のWindows Pythonに同梱）。
+
+---
+
+## 実行手順
+
+### 1) 受信サービス起動（必須）
+
+```powershell
+python hl7_receiver.py --mode service --host 0.0.0.0 --port 2575 --cache monitor_cache.json
 ```
 
-## 今後実装したい機能
-1. 仮想セントラルモニタ機能
-   - 6ベッド分のHL7を生成
-   - 各ベッド20種類程度のバイタル
-   - 1分に1回送信
-   - 数値はランダム（現実的な範囲）
+### 2) GUIモニタ起動（必須）
 
-2. データ集約機能
-   - ベッド単位で最新データを保持
-   - JSONキャッシュ出力
+別ターミナルで:
 
-3. 独自モニタGUI
-   - 6ベッド × 20項目の固定表示
-   - 白背景・黒文字（OCR最適化）
-   - 位置固定・桁固定
+```powershell
+python monitor.py --cache monitor_cache.json --refresh-ms 1000
+```
+
+### 3) 仮想セントラル起動（検証時のみ）
+
+別ターミナルで:
+
+```powershell
+python generator.py --host 127.0.0.1 --port 2575 --interval 60 --enabled true
+```
+
+---
+
+## generatorの本番無効化
+
+実機セントラルに切替えるときは `generator.py` を起動しないか、明示的に無効化します。
+
+```powershell
+python generator.py --enabled false
+```
+
+---
+
+## 主要ファイル
+
+- `generator.py`: 6ベッドのランダムバイタル ORU^R01 を生成・送信
+- `hl7_receiver.py`: MLLP受信、HL7パース、ベッド単位JSONキャッシュ作成
+- `hl7_parser.py`: ORU^R01、`PV1-3`、OBXバイタル抽出
+- `monitor.py`: OCR前提の固定レイアウト表示
+

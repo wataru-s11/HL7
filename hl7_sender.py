@@ -1,239 +1,139 @@
 #!/usr/bin/env python3
-"""
-HL7送信テストツール
-統合システムのテスト用にHL7メッセージを送信
-"""
+"""仮想セントラルモニタ (generator + sender)。"""
 
-import socket
-import time
-import random
-from datetime import datetime
 import argparse
 import logging
+import random
+import socket
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
+VITAL_DEFS = [
+    {"name": "HR", "code": "ICU_HR", "unit": "bpm", "min": 60, "max": 160, "step": 4, "fmt": "{value:03.0f}"},
+    {"name": "ART_S", "code": "ICU_ART_S", "unit": "mmHg", "min": 60, "max": 140, "step": 6, "fmt": "{value:03.0f}"},
+    {"name": "ART_D", "code": "ICU_ART_D", "unit": "mmHg", "min": 30, "max": 90, "step": 5, "fmt": "{value:03.0f}"},
+    {"name": "ART_M", "code": "ICU_ART_M", "unit": "mmHg", "min": 40, "max": 110, "step": 5, "fmt": "{value:03.0f}"},
+    {"name": "CVP_M", "code": "ICU_CVP_M", "unit": "mmHg", "min": 0, "max": 20, "step": 2, "fmt": "{value:02.0f}"},
+    {"name": "RAP_M", "code": "ICU_RAP_M", "unit": "mmHg", "min": 0, "max": 20, "step": 2, "fmt": "{value:02.0f}"},
+    {"name": "SpO2", "code": "ICU_SPO2", "unit": "%", "min": 80, "max": 100, "step": 1, "fmt": "{value:03.0f}"},
+    {"name": "TSKIN", "code": "ICU_TSKIN", "unit": "Cel", "min": 34.0, "max": 39.5, "step": 0.2, "fmt": "{value:04.1f}"},
+    {"name": "TRECT", "code": "ICU_TRECT", "unit": "Cel", "min": 34.0, "max": 39.5, "step": 0.2, "fmt": "{value:04.1f}"},
+    {"name": "rRESP", "code": "ICU_RRESP", "unit": "/min", "min": 5, "max": 60, "step": 3, "fmt": "{value:03.0f}"},
+    {"name": "EtCO2", "code": "ICU_ETCO2", "unit": "mmHg", "min": 10, "max": 60, "step": 3, "fmt": "{value:03.0f}"},
+    {"name": "RR", "code": "ICU_RR", "unit": "/min", "min": 5, "max": 60, "step": 3, "fmt": "{value:03.0f}"},
+    {"name": "VTe", "code": "ICU_VTE", "unit": "mL", "min": 0, "max": 800, "step": 40, "fmt": "{value:03.0f}"},
+    {"name": "VTi", "code": "ICU_VTI", "unit": "mL", "min": 0, "max": 800, "step": 40, "fmt": "{value:03.0f}"},
+    {"name": "Ppeak", "code": "ICU_PPEAK", "unit": "cmH2O", "min": 5, "max": 40, "step": 2, "fmt": "{value:02.0f}"},
+    {"name": "PEEP", "code": "ICU_PEEP", "unit": "cmH2O", "min": 0, "max": 15, "step": 1, "fmt": "{value:02.0f}"},
+    {"name": "O2conc", "code": "ICU_O2CONC", "unit": "%", "min": 21, "max": 100, "step": 3, "fmt": "{value:03.0f}"},
+    {"name": "NO", "code": "ICU_NO", "unit": "ppm", "min": 0, "max": 40, "step": 2, "fmt": "{value:02.0f}"},
+    {"name": "BSR1", "code": "ICU_BSR1", "unit": "", "min": 0, "max": 100, "step": 4, "fmt": "{value:03.0f}"},
+    {"name": "BSR2", "code": "ICU_BSR2", "unit": "", "min": 0, "max": 100, "step": 4, "fmt": "{value:03.0f}"},
+]
+
+
+@dataclass
+class BedState:
+    bed_id: str
+    patient_id: str
+    patient_name: str
+    values: Dict[str, float]
+
+
 class HL7Sender:
-    """HL7メッセージ送信クラス"""
-    
-    # MLLP Protocol
     START_BLOCK = b'\x0b'
     END_BLOCK = b'\x1c'
     CARRIAGE_RETURN = b'\x0d'
-    
+
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-    
-    def wrap_mllp(self, message: str) -> bytes:
-        """MLLPでラップ"""
-        msg_bytes = message.encode('utf-8')
-        return self.START_BLOCK + msg_bytes + self.END_BLOCK + self.CARRIAGE_RETURN
-    
+
     def send(self, message: str) -> bool:
-        """
-        HL7メッセージを送信
-        
-        Args:
-            message: HL7メッセージ
-        
-        Returns:
-            成功時True
-        """
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            
-            logger.info(f"Connecting to {self.host}:{self.port}...")
-            sock.connect((self.host, self.port))
-            
-            # 送信
-            wrapped = self.wrap_mllp(message)
-            sock.sendall(wrapped)
-            logger.info("Message sent")
-            
-            # ACK受信
-            response = sock.recv(4096)
-            if b'MSA|AA' in response:
-                logger.info("ACK received")
-                return True
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5.0)
+                sock.connect((self.host, self.port))
+                wrapped = self.START_BLOCK + message.encode("utf-8") + self.END_BLOCK + self.CARRIAGE_RETURN
+                sock.sendall(wrapped)
+                response = sock.recv(4096)
+                return b"MSA|AA" in response
+        except Exception as exc:
+            logger.error("send failed: %s", exc)
+            return False
+
+
+def random_walk(current: float, vdef: Dict[str, float]) -> float:
+    delta = random.uniform(-vdef["step"], vdef["step"])
+    new_value = max(vdef["min"], min(vdef["max"], current + delta))
+    if isinstance(vdef["min"], int) and isinstance(vdef["max"], int):
+        return round(new_value)
+    return round(new_value, 1)
+
+
+def build_oru_message(bed: BedState) -> str:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    msg_id = f"{bed.bed_id}_{ts}"
+    lines: List[str] = [
+        f"MSH|^~\\&|VirtualCentral|ICU|Monitor|ICU|{ts}||ORU^R01|{msg_id}|P|2.5",
+        f"PID|1||{bed.patient_id}^^^MRN||{bed.patient_name}||19800101|U|||",
+        f"PV1|1|I|ICU^{bed.bed_id}",
+        f"OBR|1||{bed.bed_id}_{ts}|ICU_PANEL^ICU Vital Panel|||{ts}",
+    ]
+    for idx, vdef in enumerate(VITAL_DEFS, start=1):
+        value = bed.values[vdef["name"]]
+        ref = f"{vdef['min']}-{vdef['max']}"
+        lines.append(
+            f"OBX|{idx}|NM|{vdef['code']}^{vdef['name']}^99ICU||{value}|{vdef['unit']}|{ref}|N|||F|||{ts}|"
+        )
+    return "\n".join(lines)
+
+
+def create_beds() -> List[BedState]:
+    beds = []
+    for i in range(1, 7):
+        bed_id = f"BED{i:02d}"
+        values = {}
+        for v in VITAL_DEFS:
+            if isinstance(v["min"], int) and isinstance(v["max"], int):
+                values[v["name"]] = random.randint(v["min"], v["max"])
             else:
-                logger.warning("NACK or unexpected response")
-                return False
-        
-        except Exception as e:
-            logger.error(f"Send failed: {e}")
-            return False
-        
-        finally:
-            sock.close()
-    
-    def send_file(self, filepath: str) -> bool:
-        """ファイルからHL7メッセージを送信"""
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                message = f.read()
-            
-            logger.info(f"Sending file: {filepath}")
-            return self.send(message)
-        
-        except Exception as e:
-            logger.error(f"Failed to read file: {e}")
-            return False
+                values[v["name"]] = round(random.uniform(v["min"], v["max"]), 1)
+        beds.append(BedState(bed_id=bed_id, patient_id=f"PT{i:04d}", patient_name=f"PATIENT^{bed_id}", values=values))
+    return beds
 
 
-def generate_vital_signs_message(patient_id: str = "TEST001",
-                                 patient_name: str = "TEST^PATIENT",
-                                 with_variation: bool = False) -> str:
-    """
-    バイタルサインHL7メッセージを生成
-    
-    Args:
-        patient_id: 患者ID
-        patient_name: 患者氏名
-        with_variation: バイタルサインに変動を加える
-    
-    Returns:
-        HL7メッセージ
-    """
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    msg_id = f"MSG{timestamp}"
-    
-    # 基準値
-    base_values = {
-        "HR": 75,
-        "SpO2": 98,
-        "NIBP_SYS": 120,
-        "NIBP_DIA": 80,
-        "RR": 16,
-        "TEMP": 36.8,
-    }
-    
-    # 変動を加える
-    if with_variation:
-        vitals = {
-            "HR": base_values["HR"] + random.randint(-5, 5),
-            "SpO2": base_values["SpO2"] + random.randint(-1, 1),
-            "NIBP_SYS": base_values["NIBP_SYS"] + random.randint(-10, 10),
-            "NIBP_DIA": base_values["NIBP_DIA"] + random.randint(-8, 8),
-            "RR": base_values["RR"] + random.randint(-2, 2),
-            "TEMP": round(base_values["TEMP"] + random.uniform(-0.3, 0.3), 1),
-        }
-    else:
-        vitals = base_values
-    
-    message = f"""MSH|^~\\&|Monitor|ICU|HIS|Hospital|{timestamp}||ORU^R01|{msg_id}|P|2.5
-PID|1||{patient_id}^^^MRN||{patient_name}||19800101|M|||
-OBR|1||ORDER{timestamp}|VITAL^Vital Signs|||{timestamp}
-OBX|1|NM|8867-4^Heart Rate^LN||{vitals['HR']}|bpm|60-100|N|||F|{timestamp}||
-OBX|2|NM|2708-6^Oxygen Saturation^LN||{vitals['SpO2']}|%|95-100|N|||F|{timestamp}||
-OBX|3|NM|8480-6^Systolic BP^LN||{vitals['NIBP_SYS']}|mmHg|90-140|N|||F|{timestamp}||
-OBX|4|NM|8462-4^Diastolic BP^LN||{vitals['NIBP_DIA']}|mmHg|60-90|N|||F|{timestamp}||
-OBX|5|NM|9279-1^Respiratory Rate^LN||{vitals['RR']}|/min|12-20|N|||F|{timestamp}||
-OBX|6|NM|8310-5^Body Temperature^LN||{vitals['TEMP']}|Cel|36.0-37.5|N|||F|{timestamp}||"""
-    
-    return message
-
-
-def continuous_send(host: str, port: int, interval: float = 5.0, count: int = 10):
-    """
-    継続的にHL7メッセージを送信
-    
-    Args:
-        host: 送信先ホスト
-        port: 送信先ポート
-        interval: 送信間隔（秒）
-        count: 送信回数（-1で無限）
-    """
+def run_generator(host: str, port: int, interval: int, cycles: int):
     sender = HL7Sender(host, port)
-    
-    sent = 0
-    try:
-        while count == -1 or sent < count:
-            # メッセージ生成（変動あり）
-            message = generate_vital_signs_message(
-                patient_id=f"TEST{sent:03d}",
-                with_variation=True
-            )
-            
-            # 送信
-            success = sender.send(message)
-            
-            if success:
-                sent += 1
-                logger.info(f"Progress: {sent}/{count if count > 0 else '∞'}")
-            else:
-                logger.warning("Send failed, retrying...")
-            
-            time.sleep(interval)
-    
-    except KeyboardInterrupt:
-        logger.info(f"\nStopped. Total sent: {sent}")
+    beds = create_beds()
+    cycle = 0
 
-
-def save_sample_message(filepath: str):
-    """サンプルメッセージをファイルに保存"""
-    message = generate_vital_signs_message()
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(message)
-    
-    logger.info(f"Sample message saved: {filepath}")
+    while cycles < 0 or cycle < cycles:
+        cycle += 1
+        logger.info("cycle %s start", cycle)
+        for bed in beds:
+            for v in VITAL_DEFS:
+                bed.values[v["name"]] = random_walk(bed.values[v["name"]], v)
+            msg = build_oru_message(bed)
+            ok = sender.send(msg)
+            logger.info("%s -> %s", bed.bed_id, "ACK" if ok else "NACK/ERR")
+        time.sleep(interval)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='HL7 Sender Test Tool')
-    
-    subparsers = parser.add_subparsers(dest='command', help='Command')
-    
-    # send コマンド
-    send_parser = subparsers.add_parser('send', help='Send HL7 message')
-    send_parser.add_argument('--host', type=str, default='localhost',
-                            help='Destination host')
-    send_parser.add_argument('--port', type=int, default=2575,
-                            help='Destination port')
-    send_parser.add_argument('--file', type=str,
-                            help='HL7 file to send')
-    
-    # continuous コマンド
-    cont_parser = subparsers.add_parser('continuous', 
-                                       help='Send messages continuously')
-    cont_parser.add_argument('--host', type=str, default='localhost',
-                            help='Destination host')
-    cont_parser.add_argument('--port', type=int, default=2575,
-                            help='Destination port')
-    cont_parser.add_argument('--interval', type=float, default=5.0,
-                            help='Interval between messages (seconds)')
-    cont_parser.add_argument('--count', type=int, default=10,
-                            help='Number of messages (-1 for infinite)')
-    
-    # generate コマンド
-    gen_parser = subparsers.add_parser('generate', help='Generate sample message')
-    gen_parser.add_argument('--output', type=str, default='sample_hl7.hl7',
-                           help='Output file')
-    
+    parser = argparse.ArgumentParser(description="Virtual central monitor HL7 sender")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=2575)
+    parser.add_argument("--interval", type=int, default=10, help="seconds between cycles")
+    parser.add_argument("--cycles", type=int, default=-1, help="-1 for infinite")
     args = parser.parse_args()
-    
-    if args.command == 'send':
-        sender = HL7Sender(args.host, args.port)
-        
-        if args.file:
-            sender.send_file(args.file)
-        else:
-            # デフォルトメッセージ送信
-            message = generate_vital_signs_message()
-            sender.send(message)
-    
-    elif args.command == 'continuous':
-        continuous_send(args.host, args.port, args.interval, args.count)
-    
-    elif args.command == 'generate':
-        save_sample_message(args.output)
-    
-    else:
-        parser.print_help()
+    run_generator(args.host, args.port, args.interval, args.cycles)
 
 
 if __name__ == "__main__":
