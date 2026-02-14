@@ -46,6 +46,7 @@ MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 1
 LABEL_SAFE_PAD_X = 4
 LABEL_SAFE_PAD_Y = 6
+VALUE_RESERVED_BOTTOM = 3
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -215,7 +216,7 @@ class MonitorApp:
                     anchor="e",
                     justify="right",
                 )
-                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=(0, 2))
+                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=(0, 3))
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
@@ -376,6 +377,7 @@ class MonitorApp:
         avail_h = max(label_h - (top_inset + bottom_inset), 1)
         avail_w = max(avail_w - LABEL_SAFE_PAD_X, 1)
         avail_h = max(avail_h - LABEL_SAFE_PAD_Y, 1)
+        avail_h = max(avail_h - VALUE_RESERVED_BOTTOM, 1)
 
         is_temp_vital = vital in DEC1_VITALS
         text, size, _, _ = self.fit_text_to_box(
