@@ -44,8 +44,8 @@ DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 1
-LABEL_SAFE_PAD_X = 4
-LABEL_SAFE_PAD_Y = 6
+LABEL_SAFE_PAD_X = 2
+LABEL_SAFE_PAD_Y = 4
 VALUE_RESERVED_BOTTOM = 3
 
 
@@ -142,6 +142,7 @@ class MonitorApp:
         self.value_pad_bottom = self.value_pad_y
         self.max_value_font_size = 40
         self._redrawing = False
+        self._fit_debug_logged = False
 
         self.header = tk.Label(
             self.root,
@@ -213,10 +214,10 @@ class MonitorApp:
                     bg="white",
                     fg="black",
                     font=self.value_font,
-                    anchor="e",
+                    anchor="ne",
                     justify="right",
                 )
-                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=(0, 3))
+                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=(2, 3))
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
@@ -276,7 +277,7 @@ class MonitorApp:
 
         col_gap = self.default_col_gap if W >= 1800 else 4
         row_gap = self.default_row_gap if H >= 1000 else 3
-        cell_gap = 2 if min(W, H) >= 900 else 1
+        cell_gap = 1 if min(W, H) >= 900 else 0
 
         bed_w = max((W - col_gap) // 2, 1)
         bed_h = max((H - (2 * row_gap)) // 3, 1)
@@ -317,7 +318,7 @@ class MonitorApp:
             cell.grid_configure(padx=cell_gap, pady=cell_gap)
 
     def _fit_single_text(self, text: str, avail_w: int, avail_h: int) -> tuple[bool, int, int, int]:
-        start_size = int(min(avail_h * 0.95 + 2, 64))
+        start_size = int(min(avail_h * 0.95 + 4, 72))
         font_size = max(start_size, MIN_VALUE_FONT_SIZE)
 
         while font_size >= MIN_VALUE_FONT_SIZE:
@@ -387,7 +388,12 @@ class MonitorApp:
             allow_decimal_drop=not is_temp_vital,
         )
 
-        value_label.configure(text=text, font=("Consolas", size, "normal"), anchor="e", justify="right")
+        if not self._fit_debug_logged and bed == "BED01" and vital in {"HR", "ART_S", "ART_D"}:
+            print(f"[fit-debug] {bed} {vital}: label_h={label_h}, avail_h={avail_h}, chosen_font_size={size}")
+            if vital == "ART_D":
+                self._fit_debug_logged = True
+
+        value_label.configure(text=text, font=("Consolas", size, "normal"), anchor="ne", justify="right")
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
