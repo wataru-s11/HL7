@@ -46,6 +46,9 @@ MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 1
 LABEL_SAFE_PAD_X = 2
 LABEL_SAFE_PAD_Y = 4
+# 全画面時のピクセル丸め差による上下欠けを避けるため、fit高さを安全側に寄せる。
+# 4〜8px 程度で調整可能。
+SAFE_CLIP_Y = 6
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -377,17 +380,30 @@ class MonitorApp:
         avail_h = max(area_h - 4, 1)
         avail_w = max(avail_w - LABEL_SAFE_PAD_X, 1)
         avail_h = max(avail_h - LABEL_SAFE_PAD_Y, 1)
+        fit_avail_h = max(avail_h - SAFE_CLIP_Y, 1)
 
         is_temp_vital = vital in DEC1_VITALS
         text, size, _, _ = self.fit_text_to_box(
             candidates,
             avail_w,
-            avail_h,
+            fit_avail_h,
             allow_decimal_drop=not is_temp_vital,
         )
 
+        # fit後の最終ガード: 実フォントメトリクスで上下に絶対収まるまで1pxずつ下げる。
+        max_text_h = max(avail_h - SAFE_CLIP_Y, 1)
+        while size > 1:
+            self.value_measure_font.configure(size=size)
+            text_h = int(self.value_measure_font.metrics("ascent")) + int(self.value_measure_font.metrics("descent"))
+            if text_h <= max_text_h:
+                break
+            size -= 1
+
         if not self._fit_debug_logged and bed == "BED01" and vital in {"HR", "ART_S", "ART_D"}:
-            print(f"[fit-debug] {bed} {vital}: area_h={area_h}, avail_h={avail_h}, chosen_font_size={size}")
+            print(
+                f"[fit-debug] {bed} {vital}: area_h={area_h}, avail_h={avail_h}, "
+                f"fit_avail_h={fit_avail_h}, chosen_font_size={size}"
+            )
             if vital == "ART_D":
                 self._fit_debug_logged = True
 
