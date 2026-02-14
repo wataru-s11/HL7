@@ -134,12 +134,6 @@ class MonitorApp:
         self.header_gap = 4
         self.default_col_gap = 4
         self.default_row_gap = 2
-        self.value_pad_x = 2
-        self.value_pad_y = 0
-        self.value_pad_left = self.value_pad_x
-        self.value_pad_right = self.value_pad_x
-        self.value_pad_top = self.value_pad_y
-        self.value_pad_bottom = self.value_pad_y
         self.max_value_font_size = 40
         self._redrawing = False
         self._fit_debug_logged = False
@@ -289,7 +283,7 @@ class MonitorApp:
         cell_h = max(bed_h / 5.0, 1.0)
 
         safe_cell_h = max(int(cell_h * 0.95), 1)
-        value_available_h = max(safe_cell_h - (self.value_pad_y * 2), 1)
+        value_available_h = safe_cell_h
         # 値フォントは従来より 2〜4px 程度大きくしつつ、実際の描画時は fit-to-box で必ず収める。
         value_font_size = max(int(cell_h * 0.75) + 3, MIN_VALUE_FONT_SIZE)
         while value_font_size > 6:
@@ -301,7 +295,7 @@ class MonitorApp:
             value_font_size -= 1
         self.max_value_font_size = value_font_size
 
-        label_font_size = max(min(int(cell_h * 0.18), max(value_font_size // 2, 8)), 8)
+        label_font_size = max(min(int(cell_h * 0.16), max(value_font_size // 2, 8)), 8)
         time_font_size = max(min(int(cell_h * 0.18), 14), 8)
         title_font_size = max(min(int(cell_h * 0.26), 22), 12)
 
@@ -408,7 +402,7 @@ class MonitorApp:
         descent = int(self.value_measure_font.metrics("descent"))
         text_h = max(ascent + descent, 1)
 
-        y = 0.0
+        y = -1.0
         base_y = area_h * VALUE_TARGET_RELY
         y_min = (VALUE_TOP_MARGIN + (text_h / 2)) - base_y
         y_max = (area_h - VALUE_BOTTOM_MARGIN - (text_h / 2)) - base_y
