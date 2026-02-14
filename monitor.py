@@ -43,7 +43,7 @@ VITAL_ORDER = [
 DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
-CELL_BORDER_MARGIN = 2
+CELL_BORDER_MARGIN = 1
 LABEL_SAFE_PAD_X = 4
 LABEL_SAFE_PAD_Y = 6
 
@@ -196,11 +196,14 @@ class MonitorApp:
                 row = 2 + (i // 4)
                 col = i % 4
                 cell = tk.Frame(bed_frame, bg="white", bd=1, relief="solid")
-                cell.grid(row=row, column=col, sticky="nsew", padx=2, pady=2)
+                cell.grid(row=row, column=col, sticky="nsew", padx=CELL_BORDER_MARGIN, pady=CELL_BORDER_MARGIN)
                 self.cell_frames.append(cell)
 
+                cell.grid_rowconfigure(1, weight=1)
+                cell.grid_columnconfigure(0, weight=1)
+
                 name_lbl = tk.Label(cell, text=vital, bg="white", fg="black", font=self.label_font, anchor="w")
-                name_lbl.pack(anchor="nw", padx=5, pady=(0, 0))
+                name_lbl.grid(row=0, column=0, sticky="nw", padx=5, pady=(0, 0))
                 self.vital_name_labels.append(name_lbl)
 
                 value_label = tk.Label(
@@ -212,7 +215,7 @@ class MonitorApp:
                     anchor="se",
                     justify="right",
                 )
-                value_label.pack(fill="both", expand=True, padx=6, pady=2)
+                value_label.grid(row=1, column=0, sticky="nsew", padx=6, pady=0)
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
