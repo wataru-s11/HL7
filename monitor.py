@@ -44,9 +44,9 @@ DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 0
-LABEL_SAFE_PAD_X = 2
-LABEL_SAFE_PAD_Y = 2
-VALUE_TOP_BOTTOM_MARGIN = 2
+VALUE_TOP_MARGIN = 2
+VALUE_BOTTOM_MARGIN = 3
+VALUE_TARGET_RELY = 0.45
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -207,11 +207,11 @@ class MonitorApp:
                 cell.grid_columnconfigure(0, weight=1)
 
                 name_lbl = tk.Label(cell, text=vital, bg="white", fg="black", font=self.label_font, anchor="w")
-                name_lbl.grid(row=0, column=0, sticky="nw", padx=1, pady=(0, 0))
+                name_lbl.grid(row=0, column=0, sticky="nw", padx=1, pady=0)
                 self.vital_name_labels.append(name_lbl)
 
                 value_area = tk.Frame(cell, bg="white")
-                value_area.grid(row=1, column=0, sticky="nsew", padx=1, pady=0)
+                value_area.grid(row=1, column=0, sticky="nsew", padx=1, pady=1)
 
                 value_label = tk.Label(
                     value_area,
@@ -221,7 +221,7 @@ class MonitorApp:
                     font=self.value_font,
                     justify="right",
                 )
-                value_label.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=0)
+                value_label.place(relx=1.0, rely=VALUE_TARGET_RELY, anchor="e", x=-2, y=0)
                 self.value_areas[(bed, vital)] = value_area
                 self.value_labels[(bed, vital)] = value_label
 
@@ -301,7 +301,7 @@ class MonitorApp:
             value_font_size -= 1
         self.max_value_font_size = value_font_size
 
-        label_font_size = max(min(int(cell_h * 0.20), max(value_font_size // 2, 8)), 8)
+        label_font_size = max(min(int(cell_h * 0.18), max(value_font_size // 2, 8)), 8)
         time_font_size = max(min(int(cell_h * 0.18), 14), 8)
         title_font_size = max(min(int(cell_h * 0.26), 22), 12)
 
@@ -384,10 +384,8 @@ class MonitorApp:
         area_w = max(value_area.winfo_width(), 1)
         area_h = max(value_area.winfo_height(), 1)
 
-        avail_w = max(area_w - 2, 1)
-        avail_h = max(area_h - (VALUE_TOP_BOTTOM_MARGIN * 2), 1)
-        avail_w = max(avail_w - LABEL_SAFE_PAD_X, 1)
-        avail_h = max(avail_h - LABEL_SAFE_PAD_Y, 1)
+        avail_w = area_w
+        avail_h = area_h
 
         is_temp_vital = vital in DEC1_VITALS
         text, size, _, _ = self.fit_text_to_box(
@@ -410,16 +408,17 @@ class MonitorApp:
         descent = int(self.value_measure_font.metrics("descent"))
         text_h = max(ascent + descent, 1)
 
-        y = 0
-        y_min = int(VALUE_TOP_BOTTOM_MARGIN + (text_h / 2) - (area_h * 0.5))
-        y_max = int((area_h * 0.5) - (text_h / 2) - VALUE_TOP_BOTTOM_MARGIN)
+        y = 0.0
+        base_y = area_h * VALUE_TARGET_RELY
+        y_min = (VALUE_TOP_MARGIN + (text_h / 2)) - base_y
+        y_max = (area_h - VALUE_BOTTOM_MARGIN - (text_h / 2)) - base_y
         if y_min > y_max:
             y = y_min
         else:
             y = max(y_min, min(y, y_max))
 
         value_label.configure(text=text, font=("Consolas", size, "normal"), justify="right")
-        value_label.place_configure(relx=1.0, rely=0.5, anchor="e", x=-2, y=y)
+        value_label.place_configure(relx=1.0, rely=VALUE_TARGET_RELY, anchor="e", x=-2, y=int(round(y)))
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
