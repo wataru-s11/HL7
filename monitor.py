@@ -215,7 +215,7 @@ class MonitorApp:
                     anchor="e",
                     justify="right",
                 )
-                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=0)
+                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=(0, 2))
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
@@ -316,7 +316,7 @@ class MonitorApp:
             cell.grid_configure(padx=cell_gap, pady=cell_gap)
 
     def _fit_single_text(self, text: str, avail_w: int, avail_h: int) -> tuple[bool, int, int, int]:
-        start_size = int(min(avail_h * 0.85 + 3, 48))
+        start_size = int(min(avail_h * 0.95 + 2, 64))
         font_size = max(start_size, MIN_VALUE_FONT_SIZE)
 
         while font_size >= MIN_VALUE_FONT_SIZE:
