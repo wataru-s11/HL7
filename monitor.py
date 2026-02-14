@@ -43,9 +43,10 @@ VITAL_ORDER = [
 DEC1_VITALS = {"TSKIN", "TRECT", "TEMP"}
 MIN_VALUE_FONT_SIZE = 18
 MISSING_PLACEHOLDER = "...."
-CELL_BORDER_MARGIN = 1
+CELL_BORDER_MARGIN = 0
 LABEL_SAFE_PAD_X = 2
-LABEL_SAFE_PAD_Y = 4
+LABEL_SAFE_PAD_Y = 2
+VALUE_TOP_BOTTOM_MARGIN = 2
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -128,11 +129,11 @@ class MonitorApp:
 
         self.safe_top = 8
         self.safe_bottom = 16
-        self.outer_margin = 10
+        self.outer_margin = 2
         self.header_h = 40
         self.header_gap = 4
-        self.default_col_gap = 8
-        self.default_row_gap = 6
+        self.default_col_gap = 4
+        self.default_row_gap = 2
         self.value_pad_x = 2
         self.value_pad_y = 0
         self.value_pad_left = self.value_pad_x
@@ -201,15 +202,16 @@ class MonitorApp:
                 cell.grid(row=row, column=col, sticky="nsew", padx=CELL_BORDER_MARGIN, pady=CELL_BORDER_MARGIN)
                 self.cell_frames.append(cell)
 
+                cell.grid_rowconfigure(0, weight=0)
                 cell.grid_rowconfigure(1, weight=1)
                 cell.grid_columnconfigure(0, weight=1)
 
                 name_lbl = tk.Label(cell, text=vital, bg="white", fg="black", font=self.label_font, anchor="w")
-                name_lbl.grid(row=0, column=0, sticky="nw", padx=5, pady=(0, 0))
+                name_lbl.grid(row=0, column=0, sticky="nw", padx=1, pady=(0, 0))
                 self.vital_name_labels.append(name_lbl)
 
                 value_area = tk.Frame(cell, bg="white")
-                value_area.grid(row=1, column=0, sticky="nsew", padx=1, pady=1)
+                value_area.grid(row=1, column=0, sticky="nsew", padx=1, pady=0)
 
                 value_label = tk.Label(
                     value_area,
@@ -219,7 +221,7 @@ class MonitorApp:
                     font=self.value_font,
                     justify="right",
                 )
-                value_label.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=-3)
+                value_label.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=0)
                 self.value_areas[(bed, vital)] = value_area
                 self.value_labels[(bed, vital)] = value_label
 
@@ -278,8 +280,8 @@ class MonitorApp:
         self.canvas_w = W
         self.canvas_h = H
 
-        col_gap = self.default_col_gap if W >= 1800 else 4
-        row_gap = self.default_row_gap if H >= 1000 else 3
+        col_gap = self.default_col_gap if W >= 1800 else 2
+        row_gap = self.default_row_gap if H >= 1000 else 1
         cell_gap = 1 if min(W, H) >= 900 else 0
 
         bed_w = max((W - col_gap) // 2, 1)
@@ -299,7 +301,7 @@ class MonitorApp:
             value_font_size -= 1
         self.max_value_font_size = value_font_size
 
-        label_font_size = max(min(int(cell_h * 0.24), max(value_font_size // 2, 8)), 8)
+        label_font_size = max(min(int(cell_h * 0.20), max(value_font_size // 2, 8)), 8)
         time_font_size = max(min(int(cell_h * 0.18), 14), 8)
         title_font_size = max(min(int(cell_h * 0.26), 22), 12)
 
@@ -382,8 +384,8 @@ class MonitorApp:
         area_w = max(value_area.winfo_width(), 1)
         area_h = max(value_area.winfo_height(), 1)
 
-        avail_w = max(area_w - 4, 1)
-        avail_h = max(area_h - 4, 1)
+        avail_w = max(area_w - 2, 1)
+        avail_h = max(area_h - (VALUE_TOP_BOTTOM_MARGIN * 2), 1)
         avail_w = max(avail_w - LABEL_SAFE_PAD_X, 1)
         avail_h = max(avail_h - LABEL_SAFE_PAD_Y, 1)
 
@@ -403,8 +405,21 @@ class MonitorApp:
             if vital == "ART_D":
                 self._fit_debug_logged = True
 
+        self.value_measure_font.configure(size=size)
+        ascent = int(self.value_measure_font.metrics("ascent"))
+        descent = int(self.value_measure_font.metrics("descent"))
+        text_h = max(ascent + descent, 1)
+
+        y = 0
+        y_min = int(VALUE_TOP_BOTTOM_MARGIN + (text_h / 2) - (area_h * 0.5))
+        y_max = int((area_h * 0.5) - (text_h / 2) - VALUE_TOP_BOTTOM_MARGIN)
+        if y_min > y_max:
+            y = y_min
+        else:
+            y = max(y_min, min(y, y_max))
+
         value_label.configure(text=text, font=("Consolas", size, "normal"), justify="right")
-        value_label.place_configure(relx=1.0, rely=0.5, anchor="e", x=-2, y=-3)
+        value_label.place_configure(relx=1.0, rely=0.5, anchor="e", x=-2, y=y)
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
