@@ -133,7 +133,7 @@ class MonitorApp:
         self.header_gap = 4
         self.default_col_gap = 8
         self.default_row_gap = 6
-        self.value_pad_x = 6
+        self.value_pad_x = 2
         self.value_pad_y = 0
         self.value_pad_left = self.value_pad_x
         self.value_pad_right = self.value_pad_x
@@ -212,10 +212,10 @@ class MonitorApp:
                     bg="white",
                     fg="black",
                     font=self.value_font,
-                    anchor="se",
+                    anchor="e",
                     justify="right",
                 )
-                value_label.grid(row=1, column=0, sticky="nsew", padx=6, pady=0)
+                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=0)
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
@@ -374,8 +374,8 @@ class MonitorApp:
 
         avail_w = max(label_w - (left_inset + right_inset), 1)
         avail_h = max(label_h - (top_inset + bottom_inset), 1)
-        avail_w = max(avail_w - (LABEL_SAFE_PAD_X * 2), 1)
-        avail_h = max(avail_h - (LABEL_SAFE_PAD_Y * 2), 1)
+        avail_w = max(avail_w - LABEL_SAFE_PAD_X, 1)
+        avail_h = max(avail_h - LABEL_SAFE_PAD_Y, 1)
 
         is_temp_vital = vital in DEC1_VITALS
         text, size, _, _ = self.fit_text_to_box(
@@ -385,7 +385,7 @@ class MonitorApp:
             allow_decimal_drop=not is_temp_vital,
         )
 
-        value_label.configure(text=text, font=("Consolas", size, "normal"), anchor="se", justify="right")
+        value_label.configure(text=text, font=("Consolas", size, "normal"), anchor="e", justify="right")
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
