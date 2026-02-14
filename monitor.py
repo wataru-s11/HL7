@@ -46,7 +46,6 @@ MISSING_PLACEHOLDER = "...."
 CELL_BORDER_MARGIN = 1
 LABEL_SAFE_PAD_X = 2
 LABEL_SAFE_PAD_Y = 4
-VALUE_RESERVED_BOTTOM = 3
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -160,6 +159,7 @@ class MonitorApp:
         self.canvas_h = 1
 
         self.value_labels: dict[tuple[str, str], tk.Label] = {}
+        self.value_areas: dict[tuple[str, str], tk.Frame] = {}
         self.updated_labels: dict[str, tk.Label] = {}
         self.bed_frames: dict[str, tk.Frame] = {}
         self.cell_frames: list[tk.Frame] = []
@@ -208,16 +208,19 @@ class MonitorApp:
                 name_lbl.grid(row=0, column=0, sticky="nw", padx=5, pady=(0, 0))
                 self.vital_name_labels.append(name_lbl)
 
+                value_area = tk.Frame(cell, bg="white")
+                value_area.grid(row=1, column=0, sticky="nsew", padx=1, pady=1)
+
                 value_label = tk.Label(
-                    cell,
+                    value_area,
                     text="NA",
                     bg="white",
                     fg="black",
                     font=self.value_font,
-                    anchor="ne",
                     justify="right",
                 )
-                value_label.grid(row=1, column=0, sticky="nsew", padx=2, pady=(2, 3))
+                value_label.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=-3)
+                self.value_areas[(bed, vital)] = value_area
                 self.value_labels[(bed, vital)] = value_label
 
         self.root.update_idletasks()
@@ -318,7 +321,7 @@ class MonitorApp:
             cell.grid_configure(padx=cell_gap, pady=cell_gap)
 
     def _fit_single_text(self, text: str, avail_w: int, avail_h: int) -> tuple[bool, int, int, int]:
-        start_size = int(min(avail_h * 0.95 + 4, 72))
+        start_size = int(min(avail_h * 0.95 + 6, 74))
         font_size = max(start_size, MIN_VALUE_FONT_SIZE)
 
         while font_size >= MIN_VALUE_FONT_SIZE:
@@ -364,21 +367,16 @@ class MonitorApp:
 
     def render_value(self, bed: str, vital: str, candidates: list[str]):
         value_label = self.value_labels[(bed, vital)]
+        value_area = self.value_areas[(bed, vital)]
 
-        value_label.update_idletasks()
-        label_w = max(value_label.winfo_width(), 1)
-        label_h = max(value_label.winfo_height(), 1)
+        value_area.update_idletasks()
+        area_w = max(value_area.winfo_width(), 1)
+        area_h = max(value_area.winfo_height(), 1)
 
-        left_inset = self.value_pad_left + CELL_BORDER_MARGIN
-        right_inset = self.value_pad_right + CELL_BORDER_MARGIN
-        top_inset = self.value_pad_top
-        bottom_inset = self.value_pad_bottom
-
-        avail_w = max(label_w - (left_inset + right_inset), 1)
-        avail_h = max(label_h - (top_inset + bottom_inset), 1)
+        avail_w = max(area_w - 4, 1)
+        avail_h = max(area_h - 4, 1)
         avail_w = max(avail_w - LABEL_SAFE_PAD_X, 1)
         avail_h = max(avail_h - LABEL_SAFE_PAD_Y, 1)
-        avail_h = max(avail_h - VALUE_RESERVED_BOTTOM, 1)
 
         is_temp_vital = vital in DEC1_VITALS
         text, size, _, _ = self.fit_text_to_box(
@@ -389,11 +387,12 @@ class MonitorApp:
         )
 
         if not self._fit_debug_logged and bed == "BED01" and vital in {"HR", "ART_S", "ART_D"}:
-            print(f"[fit-debug] {bed} {vital}: label_h={label_h}, avail_h={avail_h}, chosen_font_size={size}")
+            print(f"[fit-debug] {bed} {vital}: area_h={area_h}, avail_h={avail_h}, chosen_font_size={size}")
             if vital == "ART_D":
                 self._fit_debug_logged = True
 
-        value_label.configure(text=text, font=("Consolas", size, "normal"), anchor="ne", justify="right")
+        value_label.configure(text=text, font=("Consolas", size, "normal"), justify="right")
+        value_label.place_configure(relx=1.0, rely=0.5, anchor="e", x=-2, y=-3)
 
     def load_cache(self) -> dict | None:
         if not self.cache_path.exists():
