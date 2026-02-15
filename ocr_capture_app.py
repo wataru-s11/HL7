@@ -5,6 +5,7 @@ import argparse
 import json
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -260,6 +261,21 @@ def iso_now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
+def save_cache_snapshot(cache_path: Path, outdir: Path, outdir_label: str, stamp: str) -> str | None:
+    day = datetime.now().strftime("%Y%m%d")
+    rel_path = Path("cache") / day / f"{stamp}_monitor_cache.json"
+    dest_path = outdir / rel_path
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(5):
+        try:
+            shutil.copy2(cache_path, dest_path)
+            return f"{outdir_label.rstrip('/')}/{rel_path.as_posix()}"
+        except (FileNotFoundError, PermissionError, OSError):
+            time.sleep(0.05)
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Capture monitor.py screen and run OCR into JSONL")
     parser.add_argument("--cache", default="monitor_cache.json")
@@ -282,6 +298,7 @@ def main() -> None:
 
     config_path = Path(args.config)
     config = ensure_config(config_path)
+    cache_path = Path(args.cache)
 
     monitor_cmd = [
         sys.executable,
@@ -337,6 +354,10 @@ def main() -> None:
                     if args.debug_roi:
                         draw_debug_rois(frame, rois, debug_dir / f"{stamp}_roi.png")
 
+                    cache_snapshot_path = save_cache_snapshot(cache_path, outdir, args.outdir, stamp)
+                    if cache_snapshot_path is None:
+                        print(f"[WARN] failed to save cache snapshot for stamp={stamp}", file=sys.stderr)
+
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for roi in rois:
                         x1, y1, x2, y2 = roi.bbox
@@ -352,6 +373,7 @@ def main() -> None:
                     record = {
                         "timestamp": iso_now(),
                         "image_path": f"{args.outdir}/{image_rel}" if image_rel else None,
+                        "cache_snapshot_path": cache_snapshot_path,
                         "source": {"app": "monitor.py", "cache": args.cache},
                         "beds": beds,
                     }
