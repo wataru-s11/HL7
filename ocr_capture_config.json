@@ -1,0 +1,20 @@
+{
+  "window_title": "HL7 Bed Monitor",
+  "header_ratio": 0.04,
+  "value_roi": {
+    "left_ratio": 0.42,
+    "right_ratio": 0.03,
+    "top_ratio": 0.1,
+    "bottom_ratio": 0.08
+  },
+  "preprocess": {
+    "grayscale": true,
+    "threshold": false,
+    "threshold_value": 160,
+    "scale": 1.5
+  },
+  "fallback_capture": {
+    "enabled": true,
+    "region": null
+  }
+}
