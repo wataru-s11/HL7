@@ -124,23 +124,21 @@ def find_window_region(title: str) -> CaptureRegion | None:
     return CaptureRegion(left=int(win.left), top=int(win.top), width=int(win.width), height=int(win.height))
 
 
-def choose_region(sct: mss.mss, config: dict[str, Any], title: str) -> CaptureRegion:
+def choose_region(sct: mss.mss, title: str, monitor_index: int) -> CaptureRegion:
     win_region = find_window_region(title)
     if win_region:
         return win_region
 
-    fallback = config.get("fallback_capture", {})
-    enabled = bool(fallback.get("enabled", True)) if isinstance(fallback, dict) else True
-    region = fallback.get("region") if isinstance(fallback, dict) else None
-    if enabled and isinstance(region, dict):
-        return CaptureRegion(
-            left=int(region.get("left", 0)),
-            top=int(region.get("top", 0)),
-            width=int(region.get("width", 1920)),
-            height=int(region.get("height", 1080)),
+    monitor_count = len(sct.monitors) - 1
+    selected_index = monitor_index
+    if selected_index < 1 or selected_index > monitor_count:
+        print(
+            f"[WARN] invalid --monitor-index {monitor_index}; using monitor 1 instead",
+            file=sys.stderr,
         )
+        selected_index = 1
 
-    monitor = sct.monitors[1]
+    monitor = sct.monitors[selected_index]
     return CaptureRegion(
         left=int(monitor["left"]),
         top=int(monitor["top"]),
@@ -272,6 +270,7 @@ def main() -> None:
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
     parser.add_argument("--config", default="ocr_capture_config.json")
     parser.add_argument("--monitor-script", default="monitor.py")
+    parser.add_argument("--monitor-index", type=int, default=2)
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -309,11 +308,21 @@ def main() -> None:
 
     try:
         with mss.mss() as sct:
+            for idx, monitor in enumerate(sct.monitors):
+                print(
+                    "[INFO] monitor "
+                    f"index={idx} width={monitor['width']} height={monitor['height']} "
+                    f"left={monitor['left']} top={monitor['top']}"
+                )
             time.sleep(1.5)
             while not stop:
                 loop_start = time.time()
                 try:
-                    region = choose_region(sct, config, str(config.get("window_title", "HL7 Bed Monitor")))
+                    region = choose_region(
+                        sct,
+                        str(config.get("window_title", "HL7 Bed Monitor")),
+                        args.monitor_index,
+                    )
                     frame = grab_frame(sct, region)
                     rois = build_rois(frame.shape[1], frame.shape[0], config)
 
