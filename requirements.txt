@@ -1,1 +1,7 @@
 PySide6>=6.7.0
+easyocr>=1.7.1
+mss>=9.0.1
+pygetwindow>=0.0.9
+pywin32>=306
+opencv-python>=4.10.0
+numpy>=1.26.0

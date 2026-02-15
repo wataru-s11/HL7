@@ -107,7 +107,7 @@ def shorten_text_for_fit(text: str, allow_decimal_drop: bool = True) -> list[str
 
 
 class MonitorApp:
-    def __init__(self, cache_path: Path, refresh_ms: int = 1000, stale_seconds: int = 30):
+    def __init__(self, cache_path: Path, refresh_ms: int = 1000, stale_seconds: int = 30, fullscreen: bool = False):
         self.cache_path = cache_path
         self.refresh_ms = refresh_ms
         self.stale_seconds = stale_seconds
@@ -120,6 +120,9 @@ class MonitorApp:
         self.root.configure(bg="white")
         self.root.geometry("1920x1080")
         self.root.minsize(1280, 760)
+        self.fullscreen = fullscreen
+        self.root.attributes("-fullscreen", self.fullscreen)
+        self.root.bind("<Escape>", self.on_escape)
 
         self.title_font = font.Font(family="Consolas", size=20, weight="bold")
         self.label_font = font.Font(family="Consolas", size=16, weight="bold")
@@ -224,6 +227,12 @@ class MonitorApp:
         self.root.bind("<Configure>", self.on_configure)
         self.canvas.bind("<Configure>", self.on_resize)
         self.root.after(200, self.redraw_all)
+
+
+    def on_escape(self, _event):
+        if self.fullscreen:
+            self.root.attributes("-fullscreen", False)
+        self.root.destroy()
 
     def on_configure(self, event):
         if event.widget is self.root:
@@ -459,14 +468,19 @@ class MonitorApp:
         self.root.mainloop()
 
 
+def parse_bool(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="HL7 monitor GUI")
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--refresh-ms", type=int, default=1000, help="JSON再読込周期(ms)")
     parser.add_argument("--stale-sec", "--stale-seconds", dest="stale_sec", type=int, default=30, help="更新停止時にNA化する秒数")
+    parser.add_argument("--fullscreen", type=parse_bool, default=False, help="起動時に全画面表示する")
     args = parser.parse_args()
 
-    app = MonitorApp(Path(args.cache), refresh_ms=args.refresh_ms, stale_seconds=args.stale_sec)
+    app = MonitorApp(Path(args.cache), refresh_ms=args.refresh_ms, stale_seconds=args.stale_sec, fullscreen=args.fullscreen)
     app.run()
 
 

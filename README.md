@@ -117,3 +117,52 @@ python generator.py --host 127.0.0.1 --port 2575 --interval 10
 - 6ベッドが FullHD 1画面内に収まる
 - 各ベッドは 4x5 の固定セルで値更新時も位置不変
 - 10秒ごとに値が更新されても `NA` がチラつかない
+
+---
+
+## OCRキャプチャ学習データ作成アプリ
+
+`ocr_capture_app.py` は `monitor.py` をサブプロセスで起動し、表示中フレームを定期キャプチャして EasyOCR で数値を抽出し、JSON Linesへ追記保存します。
+
+### 追加インストール
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+### 実行例
+
+```powershell
+python ocr_capture_app.py --cache monitor_cache.json --outdir dataset --interval-ms 1000 --fullscreen true
+```
+
+### 主なオプション
+
+- `--save-images false` : 画像保存を無効化（`ocr_results.jsonl` のみ追記）
+- `--debug-roi true` : ROI枠付きデバッグ画像を `dataset/debug/` に保存
+- `--config ocr_capture_config.json` : ROI比率・前処理・fallback領域を設定
+
+### 出力
+
+- `dataset/images/*.png` : フレーム画像
+- `dataset/ocr_results.jsonl` : 1フレーム=1JSON（append）
+
+JSONレコード例:
+
+```json
+{
+  "timestamp": "2026-02-14T11:32:01.123+09:00",
+  "image_path": "dataset/images/20260214_113201_123.png",
+  "source": {"app": "monitor.py", "cache": "monitor_cache.json"},
+  "beds": {
+    "BED01": {
+      "HR": {"text": "160", "value": 160.0, "confidence": 0.92}
+    }
+  }
+}
+```
+
+### monitor.py 全画面起動
+
+- `monitor.py` に `--fullscreen true` を追加。
+- 全画面中は `Esc` で全画面解除し、そのまま終了できます。
