@@ -1014,7 +1014,8 @@ def ocr_numeric_roi(
 
     subimg, tighten_debug = foreground_auto_tighten(img)
     padded = add_padding(subimg, pad=30)
-    upscaled = upscale(padded, scale=3)
+    upscale_scale = 4 if field in {"CVP_M", "RAP_M"} else 3
+    upscaled = upscale(padded, scale=upscale_scale)
     gray = to_gray(upscaled)
 
     pass_image_map: dict[str, np.ndarray] = {
@@ -2331,13 +2332,72 @@ def main() -> None:
                                 print(
                                     f"[WARN] ocr_fail_saved bed={bed} field={vital} files={','.join(saved_files)} reason={save_reason}"
                                 )
+                                text = str(ocr_result.get("text") or "")
+                                value = ocr_result.get("value")
+                                conf_value = safe_float(ocr_result.get("conf"))
+                                conf = conf_value if conf_value is not None else 0.0
+                                method = str(ocr_result.get("method") or "none")
+                                ocr_pass = str(ocr_result.get("ocr_pass") or "none")
+                                imputed = bool(ocr_result.get("imputed", False))
 
-                            if args.debug_roi and roi_tick_dir is not None:
-                                cv2.imwrite(str(roi_tick_dir / f"roi_{bed}_{vital}.png"), roi_crop_raw)
-                                print(
-                                    f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} "
-                                    f"OCR text='{text}' method={method} pass={ocr_pass}"
-                                )
+                                beds[bed][vital] = {
+                                    "text": text,
+                                    "value": value,
+                                    "confidence": conf,
+                                    "ocr_method": method,
+                                    "ocr_conf": conf_value,
+                                    "imputed": imputed,
+                                    "ocr_pass": ocr_pass,
+                                }
+
+                                if value is not None and not imputed:
+                                    last_confirmed_values.setdefault(bed, {})[vital] = value
+
+                                if not text:
+                                    missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                    bed_debug[vital] = ocr_result.get("debug", {})
+
+                                save_target = fail_roi_fields is None or vital in fail_roi_fields
+                                should_save, save_reason = should_save_failed_roi(ocr_result, text, value)
+                                if (
+                                    args.save_fail_roi
+                                    and save_target
+                                    and should_save
+                                    and fail_roi_saved_in_tick < max(int(args.fail_roi_max_per_tick), 0)
+                                ):
+                                    saved_files = save_failed_roi_artifacts(
+                                        fail_roi_dir,
+                                        timestamp=stamp,
+                                        bed=bed,
+                                        field=vital,
+                                        roi_coords=roi_coords,
+                                        ocr_result=ocr_result,
+                                    )
+                                    fail_roi_saved_in_tick += 1
+                                    print(
+                                        f"[WARN] ocr_fail_saved bed={bed} field={vital} files={','.join(saved_files)} reason={save_reason}"
+                                    )
+
+                                if args.debug_roi and roi_tick_dir is not None:
+                                    cv2.imwrite(str(roi_tick_dir / f"roi_{bed}_{vital}.png"), roi_crop_raw)
+                                    print(
+                                        f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} "
+                                        f"OCR text='{text}' method={method} pass={ocr_pass}"
+                                    )
+                            except Exception as field_exc:  # noqa: BLE001
+                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                err_msg = str(field_exc)
+                                beds[bed][vital] = {
+                                    "text": "",
+                                    "value": None,
+                                    "confidence": 0.0,
+                                    "ocr_method": "field_error",
+                                    "ocr_conf": None,
+                                    "imputed": False,
+                                    "ocr_pass": "none",
+                                }
+                                bed_debug[vital] = {"error": err_msg}
+                                print(f"[WARN] field ocr failed bed={bed} field={vital} err={err_msg}", file=sys.stderr)
                         if bed_debug:
                             record_debug[bed] = bed_debug
 
