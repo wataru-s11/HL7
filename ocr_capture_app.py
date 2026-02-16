@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import unicodedata
 import re
 import shutil
 import subprocess
@@ -82,6 +83,20 @@ DEFAULT_VITAL_RANGES: dict[str, tuple[float, float]] = {
     "BSR2": (0.0, 100.0),
 }
 
+DEFAULT_FIELD_ALLOWLIST = "0123456789"
+FIELD_ALLOWLISTS: dict[str, str] = {
+    "TSKIN": "0123456789.",
+    "TRECT": "0123456789.",
+}
+FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
+    "TSKIN": re.compile(r"^\d{2}(?:\.\d)?$"),
+    "TRECT": re.compile(r"^\d{2}(?:\.\d)?$"),
+    "HR": re.compile(r"^\d{1,3}$"),
+    "RR": re.compile(r"^\d{1,3}$"),
+    "rRESP": re.compile(r"^\d{1,3}$"),
+    "SpO2": re.compile(r"^\d{1,3}$"),
+}
+
 
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -135,6 +150,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "morph_kernel": 2,
         "ocr_variants": ["normal", "invert", "otsu"],
     },
+    "ocr_numeric": {
+        "morph_kernel": 2,
+    },
+    "debug_save_failed_roi": False,
     "vital_ranges": DEFAULT_VITAL_RANGES,
 }
 
@@ -574,6 +593,15 @@ def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(v, hi))
 
 
+def safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def load_exported_roi_map(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -777,6 +805,217 @@ def preprocess_roi(img: np.ndarray, vital_name: str, config: dict[str, Any], var
         out = cv2.bitwise_not(out)
 
     return out
+
+
+def add_padding(img: np.ndarray, pad: int = 30, color: int = 255) -> np.ndarray:
+    pad_px = max(int(pad), 0)
+    if pad_px <= 0:
+        return img
+    return cv2.copyMakeBorder(img, pad_px, pad_px, pad_px, pad_px, cv2.BORDER_CONSTANT, value=color)
+
+
+def upscale(img: np.ndarray, scale: float = 3.0) -> np.ndarray:
+    scale_v = float(scale)
+    if scale_v <= 1.0:
+        return img
+    return cv2.resize(img, None, fx=scale_v, fy=scale_v, interpolation=cv2.INTER_CUBIC)
+
+
+def to_gray(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        return img
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def binarize(img: np.ndarray, invert: bool = False) -> np.ndarray:
+    gray = to_gray(img)
+    mode = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, out = cv2.threshold(gray, 0, 255, mode + cv2.THRESH_OTSU)
+    return out
+
+
+def _morph(img: np.ndarray, kernel_size: int = 2) -> np.ndarray:
+    k = max(int(kernel_size), 0)
+    if k <= 0:
+        return img
+    kernel = np.ones((k, k), np.uint8)
+    out = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
+    out = cv2.morphologyEx(out, cv2.MORPH_OPEN, kernel)
+    return out
+
+
+def _field_allowlist(field_name: str) -> str:
+    return FIELD_ALLOWLISTS.get(field_name, DEFAULT_FIELD_ALLOWLIST)
+
+
+def _field_pattern(field_name: str, allowlist: str) -> re.Pattern[str]:
+    explicit = FIELD_PATTERNS.get(field_name)
+    if explicit is not None:
+        return explicit
+    if "/" in allowlist:
+        return re.compile(r"^\d{2,3}/\d{2,3}$")
+    if "." in allowlist:
+        return re.compile(r"^\d{1,4}(?:\.\d{1,2})?$")
+    return re.compile(r"^\d{1,4}$")
+
+
+def _normalize_ocr_text(text: str, allowlist: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = normalized.strip().replace(" ", "")
+    normalized = "".join(ch for ch in normalized if ch in allowlist)
+    if normalized.count(".") > 1:
+        head, *tail = normalized.split(".")
+        normalized = head + "." + "".join(tail)
+    if normalized.count("/") > 1:
+        head, *tail = normalized.split("/")
+        normalized = head + "/" + "".join(tail)
+    return normalized
+
+
+def _parse_value_with_allowlist(text: str, field_name: str, config: dict[str, Any]) -> float | None:
+    if "/" in text:
+        return None
+    return parse_numeric(text, field_name, config)
+
+
+def _continuity_bonus(value: float | None, prior_value: float | int | None) -> float:
+    if value is None or prior_value is None:
+        return 0.0
+    prior = safe_float(prior_value)
+    if prior is None:
+        return 0.0
+    base = max(abs(prior), 1.0)
+    delta_ratio = abs(value - prior) / base
+    if delta_ratio <= 0.03:
+        return 0.25
+    if delta_ratio <= 0.10:
+        return 0.15
+    if delta_ratio <= 0.30:
+        return 0.05
+    return -0.10
+
+
+def _score_candidate(
+    text: str,
+    conf: float | None,
+    format_ok: bool,
+    value: float | None,
+    prior_value: float | int | None,
+) -> float:
+    score = (conf if conf is not None else 0.35) * 1.5
+    score += 0.8 if format_ok else -0.4
+    score += min(len(text), 4) * 0.08
+    score += 0.2 if value is not None else -0.2
+    score += _continuity_bonus(value, prior_value)
+    return score
+
+
+def _easyocr_read_numeric(
+    reader: easyocr.Reader,
+    image: np.ndarray,
+    allowlist: str,
+    detector: bool,
+) -> tuple[str, float | None]:
+    results = reader.readtext(
+        image,
+        detail=1,
+        paragraph=False,
+        allowlist=allowlist,
+        decoder="greedy",
+        detector=detector,
+    )
+    best_text = ""
+    best_conf: float | None = None
+    for row in results:
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            continue
+        _bbox, text, conf = row
+        conf_v = safe_float(conf)
+        if conf_v is None:
+            continue
+        if best_conf is None or conf_v > best_conf:
+            best_conf = conf_v
+            best_text = str(text)
+    return best_text, best_conf
+
+
+def ocr_numeric_roi(
+    reader: easyocr.Reader,
+    roi_img: np.ndarray,
+    field_name: str,
+    prior_value: float | int | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    allowlist = _field_allowlist(field_name)
+    pattern = _field_pattern(field_name, allowlist)
+    pp = config.get("ocr_numeric", {}) if isinstance(config.get("ocr_numeric"), dict) else {}
+    morph_kernel = int(pp.get("morph_kernel", 2))
+
+    pass_images: list[tuple[str, np.ndarray, bool]] = []
+    gray = to_gray(roi_img)
+    pass_images.append(("passA_gray_pad_scale2", upscale(add_padding(gray, pad=30), scale=2), False))
+    strong_base = upscale(add_padding(gray, pad=34), scale=3)
+    pass_images.append(("passB_gray", strong_base, False))
+    pass_images.append(("passB_otsu", _morph(binarize(strong_base, invert=False), morph_kernel), False))
+    pass_images.append(("passB_otsu_inv", _morph(binarize(strong_base, invert=True), morph_kernel), False))
+    pass_images.append(("fallback_detector", strong_base, True))
+
+    candidates: list[dict[str, Any]] = []
+    for pass_name, pass_img, use_detector in pass_images:
+        if pass_img.size == 0:
+            continue
+        raw_text, conf = _easyocr_read_numeric(reader, pass_img, allowlist, detector=use_detector)
+        norm_text = _normalize_ocr_text(raw_text, allowlist)
+        format_ok = bool(pattern.match(norm_text))
+        parsed_value = _parse_value_with_allowlist(norm_text, field_name, config) if format_ok else None
+        score = _score_candidate(norm_text, conf, format_ok, parsed_value, prior_value)
+        candidates.append(
+            {
+                "text": norm_text,
+                "raw_text": raw_text,
+                "value": parsed_value,
+                "conf": conf,
+                "format_ok": format_ok,
+                "method": "detector" if use_detector else "no_detector",
+                "pass": pass_name,
+                "score": score,
+            }
+        )
+
+    valid_candidates = [c for c in candidates if c["text"] and c["format_ok"]]
+    if valid_candidates:
+        winner = max(valid_candidates, key=lambda c: ((-1.0 if c["conf"] is None else c["conf"]), c["score"]))
+    elif candidates:
+        winner = max(candidates, key=lambda c: c["score"])
+    else:
+        winner = {"text": "", "value": None, "conf": None, "method": "none", "pass": "none", "score": -1.0}
+
+    text = winner.get("text") or ""
+    value = winner.get("value")
+    conf = winner.get("conf")
+    imputed = False
+    method = str(winner.get("method", "none"))
+
+    if (not text or value is None or not winner.get("format_ok", False)) and prior_value is not None:
+        text = str(prior_value)
+        value = safe_float(prior_value)
+        conf = None
+        imputed = True
+        method = "hold_last"
+
+    return {
+        "text": text,
+        "value": value,
+        "conf": conf,
+        "method": method,
+        "imputed": imputed,
+        "ocr_pass": winner.get("pass", "none"),
+        "debug": {
+            "allowlist": allowlist,
+            "winner": winner,
+            "candidates": candidates,
+        },
+    }
 
 
 def _sanitize_numeric_text(text: str) -> str:
@@ -1671,6 +1910,9 @@ def main() -> None:
             )
             mss_capture_rect = get_monitor_rect(config, mss_monitor_base)
 
+        last_confirmed_values: dict[str, dict[str, float]] = {bed: {} for bed in BED_IDS}
+        missing_by_field: dict[str, int] = {vital: 0 for vital in VITAL_ORDER}
+
         try:
             while True:
                 tick = time.time()
@@ -1820,60 +2062,60 @@ def main() -> None:
                             roi_debug_input_dir = Path(args.outdir) / "roi_debug" / stamp
                             roi_debug_input_dir.mkdir(parents=True, exist_ok=True)
 
+                    failed_roi_dir = day_dir / "debug_roi"
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for bed in BED_IDS:
                         for vital in VITAL_ORDER:
                             roi_box = rect_map.get(bed, {}).get(vital)
                             if roi_box is None:
-                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
+                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "no_roi", "imputed": False, "ocr_pass": "none"}
                                 continue
 
-                            roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
-                            if roi_crop_raw is None or roi_coords is None:
-                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
+                            roi_crop_raw, _roi_coords = crop_red_roi(frame, roi_box, bed, vital)
+                            if roi_crop_raw is None:
+                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "crop_failed", "imputed": False, "ocr_pass": "none"}
                                 continue
 
-                            roi_crop_debug = preprocess_roi(roi_crop_raw, vital, config, variant="normal")
-                            if roi_crop_debug.size == 0:
-                                print(f"[WARN] empty final ROI after preprocess, skip {bed}.{vital}", file=sys.stderr)
-                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
-                                continue
+                            if args.debug_roi and roi_debug_input_dir is not None:
+                                cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
 
-                            if args.debug_roi:
-                                print(f"[INFO] OCR input roi_final shape bed={bed} vital={vital} shape={roi_crop_debug.shape}")
-                                if roi_debug_input_dir is not None:
-                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
-                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_preprocessed.png"), roi_crop_debug)
+                            prior_value = last_confirmed_values.get(bed, {}).get(vital)
+                            ocr_result = ocr_numeric_roi(reader, roi_crop_raw, vital, prior_value, config)
+                            text = str(ocr_result.get("text") or "")
+                            value = ocr_result.get("value")
+                            conf_value = safe_float(ocr_result.get("conf"))
+                            conf = conf_value if conf_value is not None else 0.0
+                            method = str(ocr_result.get("method") or "none")
+                            ocr_pass = str(ocr_result.get("ocr_pass") or "none")
+                            imputed = bool(ocr_result.get("imputed", False))
 
-                            text, value, conf, best_bbox_local, selected_variant = ocr_with_fallback_variants(
-                                reader,
-                                roi_crop_raw,
-                                vital,
-                                config,
-                            )
-                            beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
+                            beds[bed][vital] = {
+                                "text": text,
+                                "value": value,
+                                "confidence": conf,
+                                "ocr_method": method,
+                                "ocr_conf": conf_value,
+                                "imputed": imputed,
+                                "ocr_pass": ocr_pass,
+                            }
 
-                            if args.debug_roi:
-                                if roi_tick_dir is not None:
-                                    cv2.imwrite(str(roi_tick_dir / f"roi_{bed}_{vital}.png"), roi_crop_raw)
-                                print(f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} OCR text='{text}' variant={selected_variant}")
+                            if value is not None and not imputed:
+                                last_confirmed_values.setdefault(bed, {})[vital] = value
 
-                                if args.debug_full_overlay and full_overlay_img is not None and best_bbox_local:
-                                    x1, y1, _x2, _y2 = roi_coords
-                                    scale, trim_px = get_preprocess_geometry(vital, config, roi_crop_raw)
-                                    for bbox in best_bbox_local:
-                                        if bbox.size == 0:
-                                            continue
-                                        bbox_raw_local = map_bbox_to_raw_roi(
-                                            bbox_local_final=bbox,
-                                            scale=scale,
-                                            trim_px=trim_px,
-                                            raw_shape=roi_crop_raw.shape[:2],
-                                        )
-                                        bbox_global = bbox_raw_local.copy()
-                                        bbox_global[:, 0] += x1
-                                        bbox_global[:, 1] += y1
-                                        cv2.polylines(full_overlay_img, [bbox_global.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
+                            if not text:
+                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                if bool(config.get("debug_save_failed_roi", False)):
+                                    failed_roi_dir.mkdir(parents=True, exist_ok=True)
+                                    cv2.imwrite(str(failed_roi_dir / f"{stamp}_{bed}_{vital}_{ocr_pass}.png"), roi_crop_raw)
+
+                            if args.debug_roi and roi_tick_dir is not None:
+                                cv2.imwrite(str(roi_tick_dir / f"roi_{bed}_{vital}.png"), roi_crop_raw)
+                                print(
+                                    f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} "
+                                    f"OCR text='{text}' method={method} pass={ocr_pass}"
+                                )
 
                     if debug_img is not None:
                         cv2.imwrite(str(debug_dir / f"{stamp}_debug_rois.png"), debug_img)
@@ -1898,6 +2140,8 @@ def main() -> None:
 
                     if args.run_validator:
                         run_validator_once(jsonl, cache_path, validator_config, max(args.validator_last, 1))
+
+                    print(f"[INFO] missing_by_field={json.dumps(missing_by_field, ensure_ascii=False)}")
 
                 except Exception as exc:  # noqa: BLE001
                     print(f"[WARN] frame skipped due to error: {exc}", file=sys.stderr)
