@@ -2521,9 +2521,20 @@ def main() -> None:
                                 if vital in {"CVP_M", "RAP_M"}:
                                     print(f"[INFO] fixed_roi_coords bed={bed} field={vital} coords={roi_coords}")
 
+                                roi_for_ocr = roi_crop_raw
+                                if vital == "ART_M":
+                                    _, roi_width = roi_crop_raw.shape[:2]
+                                    trim_x = int(roi_width * 0.05)
+                                    if trim_x > 0 and trim_x < roi_width:
+                                        roi_for_ocr = roi_crop_raw[:, trim_x:]
+                                        print(
+                                            f"[INFO] art_m_left_trim_applied bed={bed} field={vital} "
+                                            f"trim_px={trim_x} original_w={roi_width}"
+                                        )
+
                                 prior_value = last_confirmed_values.get(bed, {}).get(vital)
                                 ocr_result = ocr_numeric_roi(
-                                    roi_crop_raw,
+                                    roi_for_ocr,
                                     reader,
                                     field_name=vital,
                                     prior_value=prior_value,
