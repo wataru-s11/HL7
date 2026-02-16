@@ -120,10 +120,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "y1_ratio": 0.12,
         "y2_ratio": 0.90,
     },
+    "value_roi_inset_px": 2,
     # MOD: vital別ROI微調整設定を追加（px/ratioの両対応）
     "per_vital_roi_adjust": {},
     "preprocess": {
-        "resize": 2.5,
+        "scale": 4.0,
+        "threshold": True,
+        "threshold_value": 170,
+        "resize": 4.0,
         "trim_px": 3,
         "threshold_mode": "adaptive",
         "adaptive_block_size": 31,
@@ -490,10 +494,14 @@ def ensure_config(path: Path) -> dict[str, Any]:
     if "bottom_pad" not in roi_cfg and "bottom_ratio" in roi_cfg:
         roi_cfg["bottom_pad"] = roi_cfg.get("bottom_ratio")
     pp_cfg = config.get("preprocess", {})
-    if "resize" not in pp_cfg and "scale" in pp_cfg:
-        pp_cfg["resize"] = pp_cfg.get("scale")
-    if "threshold" in pp_cfg and "threshold_mode" not in pp_cfg:
-        pp_cfg["threshold_mode"] = "otsu" if pp_cfg.get("threshold") else "adaptive"
+    scale_value = pp_cfg.get("scale", pp_cfg.get("resize", 4.0))
+    pp_cfg["scale"] = scale_value
+    pp_cfg["resize"] = pp_cfg.get("resize", scale_value)
+    pp_cfg["threshold"] = bool(pp_cfg.get("threshold", True))
+    try:
+        pp_cfg["threshold_value"] = int(pp_cfg.get("threshold_value", 170))
+    except Exception:
+        pp_cfg["threshold_value"] = 170
     config["value_roi"] = roi_cfg
     vb_cfg = dict(DEFAULT_CONFIG.get("value_box", {}))
     vb_cfg.update(config.get("value_box", {}) if isinstance(config.get("value_box"), dict) else {})
@@ -709,11 +717,11 @@ def preprocess_roi(img: np.ndarray, vital_name: str, config: dict[str, Any], var
     pp = config.get("preprocess", {}) if isinstance(config.get("preprocess"), dict) else {}
     out: np.ndarray = img.copy()
 
-    resize = float(pp.get("resize", 2.5))
+    scale = float(pp.get("scale", pp.get("resize", 4.0)))
     if vital_name in TEMPERATURE_VITALS:
-        resize = max(resize, 3.0)
-    if resize > 1.0:
-        out = cv2.resize(out, None, fx=resize, fy=resize, interpolation=cv2.INTER_CUBIC)
+        scale = max(scale, 4.0)
+    if scale > 1.0:
+        out = cv2.resize(out, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     if out.ndim == 3:
         out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
@@ -726,9 +734,14 @@ def preprocess_roi(img: np.ndarray, vital_name: str, config: dict[str, Any], var
     if trim_px > 0 and out.shape[0] > trim_px * 2 and out.shape[1] > trim_px * 2:
         out = out[trim_px:-trim_px, trim_px:-trim_px]
 
+    use_threshold = bool(pp.get("threshold", True))
     threshold_mode = str(pp.get("threshold_mode", "adaptive")).lower()
     if variant == "otsu" or threshold_mode == "otsu":
         _, out = cv2.threshold(out, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    elif use_threshold:
+        threshold_value = int(pp.get("threshold_value", 170))
+        threshold_value = clamp(threshold_value, 0, 255)
+        _, out = cv2.threshold(out, threshold_value, 255, cv2.THRESH_BINARY)
     else:
         block_size = int(pp.get("adaptive_block_size", 31))
         if block_size % 2 == 0:
@@ -839,9 +852,9 @@ def draw_ocr_bbox_overlay(roi_crop_final: np.ndarray, ocr_results: list[tuple[np
 def get_preprocess_geometry(vital_name: str, config: dict[str, Any], roi_crop_raw: np.ndarray) -> tuple[float, int]:
     """Return (resize_scale, trim_px_after_resize) used by preprocess_roi for coordinate mapping."""
     pp = config.get("preprocess", {}) if isinstance(config.get("preprocess"), dict) else {}
-    resize = float(pp.get("resize", 2.5))
+    resize = float(pp.get("scale", pp.get("resize", 4.0)))
     if vital_name in TEMPERATURE_VITALS:
-        resize = max(resize, 3.0)
+        resize = max(resize, 4.0)
     scale = resize if resize > 1.0 else 1.0
 
     resized_h = int(round(roi_crop_raw.shape[0] * scale))
@@ -876,23 +889,59 @@ def map_bbox_to_raw_roi(
 
 def crop_red_roi(frame: np.ndarray, roi_box: tuple[int, int, int, int], bed: str, vital: str) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
     frame_h, frame_w = frame.shape[:2]
-    x1, y1, x2, y2 = (int(roi_box[0]), int(roi_box[1]), int(roi_box[2]), int(roi_box[3]))
+    vx1, vy1, vx2, vy2 = (int(roi_box[0]), int(roi_box[1]), int(roi_box[2]), int(roi_box[3]))
 
-    if x1 >= x2 or y1 >= y2:
-        print(f"[WARN] invalid red ROI shape, skip {bed}.{vital}: ({x1}, {y1}, {x2}, {y2})", file=sys.stderr)
+    if vx1 >= vx2 or vy1 >= vy2:
+        print(f"[WARN] invalid red ROI shape, skip {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2})", file=sys.stderr)
         return None, None
-    if x1 < 0 or y1 < 0 or x2 > frame_w or y2 > frame_h:
+    if vx1 < 0 or vy1 < 0 or vx2 > frame_w or vy2 > frame_h:
         print(
-            f"[WARN] red ROI out of capture-image bounds, skip {bed}.{vital}: ({x1}, {y1}, {x2}, {y2}) frame=({frame_w}x{frame_h})",
+            f"[WARN] red ROI out of capture-image bounds, skip {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2}) frame=({frame_w}x{frame_h})",
             file=sys.stderr,
         )
         return None, None
 
-    roi_crop = frame[y1:y2, x1:x2].copy()
+    roi_crop = frame[vy1:vy2, vx1:vx2].copy()
     if roi_crop.size == 0:
-        print(f"[WARN] empty red ROI crop, skip {bed}.{vital}: ({x1}, {y1}, {x2}, {y2})", file=sys.stderr)
+        print(f"[WARN] empty red ROI crop, skip {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2})", file=sys.stderr)
         return None, None
-    return roi_crop, (x1, y1, x2, y2)
+    return roi_crop, (vx1, vy1, vx2, vy2)
+
+
+def inset_roi_box(
+    roi_box: tuple[int, int, int, int],
+    inset_px: int,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int] | None:
+    x1, y1, x2, y2 = (int(roi_box[0]), int(roi_box[1]), int(roi_box[2]), int(roi_box[3]))
+    inset = max(int(inset_px), 0)
+    nx1 = clamp(x1 + inset, 0, max(frame_w - 1, 0))
+    ny1 = clamp(y1 + inset, 0, max(frame_h - 1, 0))
+    nx2 = clamp(x2 - inset, 1, frame_w)
+    ny2 = clamp(y2 - inset, 1, frame_h)
+    if nx1 >= nx2 or ny1 >= ny2:
+        return None
+    return nx1, ny1, nx2, ny2
+
+
+def apply_inset_to_roi_map(
+    roi_map: dict[str, dict[str, tuple[int, int, int, int]]],
+    frame_shape: tuple[int, int, int],
+    inset_px: int,
+) -> dict[str, dict[str, tuple[int, int, int, int]]]:
+    frame_h, frame_w = frame_shape[:2]
+    adjusted: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
+    for bed in BED_IDS:
+        for vital in VITAL_ORDER:
+            box = roi_map.get(bed, {}).get(vital)
+            if box is None:
+                continue
+            inset_box = inset_roi_box(box, inset_px, frame_w, frame_h)
+            if inset_box is None:
+                continue
+            adjusted[bed][vital] = inset_box
+    return adjusted
 
 
 def _offset_from_adjust(adjust: dict[str, Any], key: str, cell_w: int, cell_h: int) -> int:
@@ -1612,9 +1661,11 @@ def main() -> None:
                         roi_source=args.roi_source,
                         capture_rect=capture_rect,
                     )
-                    rect_map = red_rois
+                    roi_inset_px = int(config.get("value_roi_inset_px", 2))
+                    rect_map = apply_inset_to_roi_map(red_rois, frame.shape, roi_inset_px)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                     roi_tick_dir: Path | None = None
+                    roi_debug_input_dir: Path | None = None
 
                     image_path = None
                     if args.save_images:
@@ -1687,6 +1738,8 @@ def main() -> None:
                         if args.debug_roi:
                             roi_tick_dir = roi_crops_dir / stamp
                             roi_tick_dir.mkdir(parents=True, exist_ok=True)
+                            roi_debug_input_dir = Path(args.outdir) / "roi_debug" / stamp
+                            roi_debug_input_dir.mkdir(parents=True, exist_ok=True)
 
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for bed in BED_IDS:
@@ -1709,6 +1762,9 @@ def main() -> None:
 
                             if args.debug_roi:
                                 print(f"[INFO] OCR input roi_final shape bed={bed} vital={vital} shape={roi_crop_final.shape}")
+                                if roi_debug_input_dir is not None:
+                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
+                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_preprocessed.png"), roi_crop_final)
 
                             text, conf, best_bbox_local, _ocr_results = ocr_one_roi(reader, roi_crop_final)
                             value = parse_numeric(text, vital, config)

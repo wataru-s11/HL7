@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+
+import cv2
+
+from ocr_capture_app import BED_IDS, DEFAULT_CONFIG, VITAL_ORDER, build_vital_rois, ensure_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,19 +19,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_roi_config(config_path: str | None, default_config: dict[str, Any], ensure_config_fn: Any) -> dict[str, Any]:
+def load_roi_config(config_path: str | None) -> dict:
     if config_path:
-        return ensure_config_fn(Path(config_path))
-    return dict(default_config)
+        return ensure_config(Path(config_path))
+    return dict(DEFAULT_CONFIG)
 
 
 def main() -> int:
     args = parse_args()
-
-    import cv2
-
-    from ocr_capture_app import BED_IDS, DEFAULT_CONFIG, VITAL_ORDER, build_vital_rois, ensure_config
-
     image_path = Path(args.image)
     outdir = Path(args.outdir)
 
@@ -38,7 +36,7 @@ def main() -> int:
 
     outdir.mkdir(parents=True, exist_ok=True)
 
-    config = load_roi_config(args.config, DEFAULT_CONFIG, ensure_config)
+    config = load_roi_config(args.config)
     rois, _debug = build_vital_rois(frame, config, return_debug=True)
 
     debug_img = frame.copy()
