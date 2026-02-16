@@ -1141,15 +1141,12 @@ def _raw_easyocr_all_empty(raw_easyocr: Any) -> bool:
 
 
 def should_save_failed_roi(ocr_result: dict[str, Any], text: str, value: Any) -> tuple[bool, str]:
-    method = str(ocr_result.get("method") or "")
     debug = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     raw_easyocr = debug.get("raw_easyocr")
     if text == "" or value is None:
         return True, "empty_text_or_none_value"
     if _raw_easyocr_all_empty(raw_easyocr):
         return True, "all_paths_detect_zero"
-    if method == "no_match":
-        return True, "no_match"
     return False, ""
 
 
@@ -1168,16 +1165,18 @@ def save_failed_roi_artifacts(
     debug_meta = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     saved_files: list[str] = []
 
-    tightened = bool(debug_meta.get("tightened", False))
-    for suffix in ("raw", "tight", "pre"):
-        if suffix == "tight" and not tightened:
-            continue
+    paths: dict[str, str | None] = {"raw": None, "pre": None, "meta": None}
+    for suffix in ("raw", "pre"):
         img = debug_images.get(suffix)
         if not isinstance(img, np.ndarray) or img.size == 0:
             continue
         out_path = fail_roi_dir / f"{prefix}_{suffix}.png"
         cv2.imwrite(str(out_path), img)
+        paths[suffix] = out_path.as_posix()
         saved_files.append(out_path.name)
+
+    meta_path = fail_roi_dir / f"{prefix}_meta.json"
+    paths["meta"] = meta_path.as_posix()
 
     meta = {
         "timestamp": timestamp,
@@ -1188,14 +1187,15 @@ def save_failed_roi_artifacts(
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
         "chosen_method": debug_meta.get("chosen_method", "none"),
         "raw_easyocr": debug_meta.get("raw_easyocr", {}),
+        "exception": debug_meta.get("exception"),
         "recognition_fallback_used": debug_meta.get("recognition_fallback_used", False),
         "boundingRect": debug_meta.get("boundingRect"),
         "black_pixel_count": debug_meta.get("black_pixel_count"),
         "tightened": debug_meta.get("tightened", False),
         "allowlist": debug_meta.get("allowlist"),
         "regex": debug_meta.get("regex"),
+        "paths": paths,
     }
-    meta_path = fail_roi_dir / f"{prefix}_meta.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     saved_files.append(meta_path.name)
     return saved_files
@@ -2029,9 +2029,9 @@ def main() -> None:
     parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
     parser.add_argument("--save-fail-roi", type=parse_bool, default=True)
-    parser.add_argument("--fail-roi-dir", default="day_dir/debug_fail_roi")
+    parser.add_argument("--fail-roi-dir", default="day_dir/debug/fail_roi")
     parser.add_argument("--fail-roi-fields", default="CVP_M,RAP_M")
-    parser.add_argument("--fail-roi-max-per-tick", type=int, default=10)
+    parser.add_argument("--fail-roi-max-per-tick", type=int, default=20)
     parser.add_argument("--gpu", type=parse_bool, default=True)
     parser.add_argument("--no-launch-monitor", type=parse_bool, default=True)  # MOD: 安全側デフォルト
     parser.add_argument("--run-validator", type=parse_bool, default=False)  # MOD
@@ -2254,7 +2254,9 @@ def main() -> None:
                             roi_debug_input_dir = Path(args.outdir) / "roi_debug" / stamp
                             roi_debug_input_dir.mkdir(parents=True, exist_ok=True)
 
-                    fail_roi_dir = day_dir / "debug_fail_roi" if args.fail_roi_dir == "day_dir/debug_fail_roi" else Path(args.fail_roi_dir)
+                    fail_roi_dir = day_dir / "debug" / "fail_roi" if args.fail_roi_dir == "day_dir/debug/fail_roi" else Path(args.fail_roi_dir)
+                    if args.save_fail_roi:
+                        fail_roi_dir.mkdir(parents=True, exist_ok=True)
                     fail_roi_saved_in_tick = 0
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     record_debug: dict[str, dict[str, Any]] = {}
@@ -2267,6 +2269,8 @@ def main() -> None:
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "no_roi", "imputed": False, "ocr_pass": "none"}
                                 continue
 
+                            roi_crop_raw: np.ndarray | None = None
+                            roi_coords: tuple[int, int, int, int] | None = None
                             try:
                                 roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
                                 if roi_crop_raw is None or roi_coords is None:
@@ -2331,7 +2335,7 @@ def main() -> None:
                                     )
                                     fail_roi_saved_in_tick += 1
                                     print(
-                                        f"[WARN] ocr_fail_saved bed={bed} field={vital} files={','.join(saved_files)} reason={save_reason}"
+                                        f"[WARN] ocr_fail_saved bed={bed} field={vital} reason={save_reason} out={fail_roi_dir}"
                                     )
 
                                 if args.debug_roi and roi_tick_dir is not None:
@@ -2353,6 +2357,43 @@ def main() -> None:
                                     "ocr_pass": "none",
                                 }
                                 bed_debug[vital] = {"error": err_msg}
+
+                                save_target = fail_roi_fields is None or vital in fail_roi_fields
+                                if (
+                                    args.save_fail_roi
+                                    and save_target
+                                    and fail_roi_saved_in_tick < max(int(args.fail_roi_max_per_tick), 0)
+                                ):
+                                    ocr_result_err = {
+                                        "text": "",
+                                        "value": None,
+                                        "conf": None,
+                                        "method": "field_error",
+                                        "ocr_pass": "none",
+                                        "debug": {
+                                            "preprocess_passes": [],
+                                            "chosen_pass": "none",
+                                            "raw_easyocr": {},
+                                            "exception": err_msg,
+                                        },
+                                        "debug_images": {
+                                            "raw": roi_crop_raw,
+                                            "pre": roi_crop_raw,
+                                        },
+                                    }
+                                    saved_files = save_failed_roi_artifacts(
+                                        fail_roi_dir,
+                                        timestamp=stamp,
+                                        bed=bed,
+                                        field=vital,
+                                        roi_coords=roi_coords if roi_coords is not None else (0, 0, 0, 0),
+                                        ocr_result=ocr_result_err,
+                                    )
+                                    fail_roi_saved_in_tick += 1
+                                    print(
+                                        f"[WARN] ocr_fail_saved bed={bed} field={vital} reason=exception out={fail_roi_dir}"
+                                    )
+
                                 print(f"[WARN] field ocr failed bed={bed} field={vital} err={err_msg}", file=sys.stderr)
                         if bed_debug:
                             record_debug[bed] = bed_debug
