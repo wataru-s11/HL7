@@ -608,6 +608,8 @@ def build_exported_rois(
     sy1, sy2 = min(y1_ratio, y2_ratio), max(y1_ratio, y2_ratio)
 
     items = roi_map.get("items", {}) if isinstance(roi_map, dict) else {}
+    roi_type = str(roi_map.get("roi_type", "")).strip().lower() if isinstance(roi_map, dict) else ""
+    use_widget_bbox_as_value_roi = roi_type == "value_widget_bbox_screen"
     blue_rois: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
     red_rois: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
     debug_meta: dict[str, dict[str, Any]] = {bed: {"source": "exported", "cell_boxes": {}, "value_rois": {}} for bed in BED_IDS}
@@ -638,16 +640,21 @@ def build_exported_rois(
             bx2c = clamp(bx2, bx1c + 1, frame_w)
             by2c = clamp(by2, by1c + 1, frame_h)
 
-            bwc = max(bx2c - bx1c, 1)
-            bhc = max(by2c - by1c, 1)
-            rx1 = bx1c + int(bwc * sx1)
-            rx2 = bx1c + int(bwc * sx2)
-            ry1 = by1c + int(bhc * sy1)
-            ry2 = by1c + int(bhc * sy2)
-            rx1 = clamp(rx1, bx1c, bx2c - 1)
-            ry1 = clamp(ry1, by1c, by2c - 1)
-            rx2 = clamp(rx2, rx1 + 1, bx2c)
-            ry2 = clamp(ry2, ry1 + 1, by2c)
+            if use_widget_bbox_as_value_roi:
+                # monitor.py exports value_areas as roi_type=value_widget_bbox_screen.
+                # Use that box as-is so red ROI matches the exact on-screen numeric area.
+                rx1, ry1, rx2, ry2 = bx1c, by1c, bx2c, by2c
+            else:
+                bwc = max(bx2c - bx1c, 1)
+                bhc = max(by2c - by1c, 1)
+                rx1 = bx1c + int(bwc * sx1)
+                rx2 = bx1c + int(bwc * sx2)
+                ry1 = by1c + int(bhc * sy1)
+                ry2 = by1c + int(bhc * sy2)
+                rx1 = clamp(rx1, bx1c, bx2c - 1)
+                ry1 = clamp(ry1, by1c, by2c - 1)
+                rx2 = clamp(rx2, rx1 + 1, bx2c)
+                ry2 = clamp(ry2, ry1 + 1, by2c)
 
             blue_rois[bed][vital] = (bx1c, by1c, bx2c, by2c)
             red_rois[bed][vital] = (rx1, ry1, rx2, ry2)
@@ -1662,6 +1669,10 @@ def main() -> None:
                         capture_rect=capture_rect,
                     )
                     roi_inset_px = int(config.get("value_roi_inset_px", 2))
+                    if args.roi_source == "exported":
+                        # Exported ROIs from monitor.py already point to the value widget,
+                        # so avoid shrinking and keep red boxes aligned with displayed numbers.
+                        roi_inset_px = 0
                     rect_map = apply_inset_to_roi_map(red_rois, frame.shape, roi_inset_px)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                     roi_tick_dir: Path | None = None
