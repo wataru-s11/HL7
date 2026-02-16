@@ -87,6 +87,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "y2_ratio": 0.88,
         "pad_px": 2,
     },
+    "cell_inner_box": {
+        "pad_px": 4,
+    },
+    "cell_value_slice": {
+        "x1_ratio": 0.50,
+        "x2_ratio": 0.98,
+        "y1_ratio": 0.12,
+        "y2_ratio": 0.90,
+    },
     # MOD: vital別ROI微調整設定を追加（px/ratioの両対応）
     "per_vital_roi_adjust": {},
     "preprocess": {"grayscale": True, "resize": 2.0, "threshold": False, "threshold_value": 160},
@@ -451,6 +460,12 @@ def ensure_config(path: Path) -> dict[str, Any]:
     vb_cfg = dict(DEFAULT_CONFIG.get("value_box", {}))
     vb_cfg.update(config.get("value_box", {}) if isinstance(config.get("value_box"), dict) else {})
     config["value_box"] = vb_cfg
+    cell_inner_cfg = dict(DEFAULT_CONFIG.get("cell_inner_box", {}))
+    cell_inner_cfg.update(config.get("cell_inner_box", {}) if isinstance(config.get("cell_inner_box"), dict) else {})
+    config["cell_inner_box"] = cell_inner_cfg
+    cell_slice_cfg = dict(DEFAULT_CONFIG.get("cell_value_slice", {}))
+    cell_slice_cfg.update(config.get("cell_value_slice", {}) if isinstance(config.get("cell_value_slice"), dict) else {})
+    config["cell_value_slice"] = cell_slice_cfg
     config["preprocess"] = pp_cfg
     config.setdefault("per_vital_roi_adjust", {})
     return config
@@ -615,7 +630,7 @@ def build_vital_rois(
     config: dict[str, Any],
     return_debug: bool = False,
 ) -> dict[str, dict[str, tuple[int, int, int, int]]] | tuple[
-    dict[str, dict[str, tuple[int, int, int, int]]], dict[str, dict[str, int | float | bool | None]]
+    dict[str, dict[str, tuple[int, int, int, int]]], dict[str, dict[str, Any]]
 ]:
     frame_h, frame_w = frame.shape[:2]
     header_crop_px = clamp(int(config.get("header_crop_px", 60)), 0, frame_h - 1)
@@ -628,23 +643,25 @@ def build_vital_rois(
     cell_cols, cell_rows = int(cell_grid.get("cols", 4)), int(cell_grid.get("rows", 5))
 
     roi_cfg = config.get("value_roi", {})
-    value_box_cfg = config.get("value_box") if isinstance(config.get("value_box"), dict) else None
     left_ratio = float(roi_cfg.get("left_ratio", 0.45))
     right_pad = float(roi_cfg.get("right_pad", 0.06))
     top_pad = float(roi_cfg.get("top_pad", 0.10))
     bottom_pad = float(roi_cfg.get("bottom_pad", 0.12))
 
-    if value_box_cfg is not None:
-        value_x1_ratio = float(value_box_cfg.get("x1_ratio", 0.58))
-        value_x2_ratio = float(value_box_cfg.get("x2_ratio", 0.98))
-        value_y1_ratio = float(value_box_cfg.get("y1_ratio", 0.20))
-        value_y2_ratio = float(value_box_cfg.get("y2_ratio", 0.88))
-        value_pad_px = max(int(value_box_cfg.get("pad_px", 2)), 0)
+    cell_inner_box_cfg = config.get("cell_inner_box") if isinstance(config.get("cell_inner_box"), dict) else {}
+    cell_value_slice_cfg = config.get("cell_value_slice") if isinstance(config.get("cell_value_slice"), dict) else {}
+    value_box_cfg = config.get("value_box") if isinstance(config.get("value_box"), dict) else None
+
+    cell_pad_px = max(int(cell_inner_box_cfg.get("pad_px", 4)), 0)
+    value_x1_ratio = float(cell_value_slice_cfg.get("x1_ratio", 0.50))
+    value_x2_ratio = float(cell_value_slice_cfg.get("x2_ratio", 0.98))
+    value_y1_ratio = float(cell_value_slice_cfg.get("y1_ratio", 0.12))
+    value_y2_ratio = float(cell_value_slice_cfg.get("y2_ratio", 0.90))
 
     adjust_cfg = config.get("per_vital_roi_adjust", {})
 
     out: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
-    debug_meta: dict[str, dict[str, int | float | bool | None]] = {}
+    debug_meta: dict[str, dict[str, Any]] = {}
 
     for bed_idx, bed in enumerate(BED_IDS):
         bed_row = bed_idx // bed_cols
@@ -676,6 +693,8 @@ def build_vital_rois(
             "header_bottom_line_y": (by1 + detected_line_y) if detected_line_y is not None else None,
             "line_ratio": line_ratio,
             "header_line_detected": detected_line_y is not None,
+            "cell_inner_boxes": {},
+            "value_rois": {},
         }
 
         for idx, vital in enumerate(VITAL_ORDER):
@@ -689,26 +708,35 @@ def build_vital_rois(
 
             cw, ch = max(cx2 - cx1, 1), max(cy2 - cy1, 1)
 
-            if value_box_cfg is not None:
-                vx1 = cx1 + int(cw * value_x1_ratio)
-                vx2 = cx1 + int(cw * value_x2_ratio)
-                vy1 = cy1 + int(ch * value_y1_ratio)
-                vy2 = cy1 + int(ch * value_y2_ratio)
-
-                vx1 += value_pad_px
-                vy1 += value_pad_px
-                vx2 -= value_pad_px
-                vy2 -= value_pad_px
-
-                vx1 = clamp(vx1, cx1, cx2 - 1)
-                vy1 = clamp(vy1, cy1, cy2 - 1)
-                vx2 = clamp(vx2, vx1 + 1, cx2)
-                vy2 = clamp(vy2, vy1 + 1, cy2)
-            else:
+            if value_box_cfg is None and not cell_value_slice_cfg and not cell_inner_box_cfg:
                 vx1 = clamp(cx1 + int(cw * left_ratio), cx1, cx2 - 1)
                 vx2 = clamp(cx2 - int(cw * right_pad), vx1 + 1, cx2)
                 vy1 = clamp(cy1 + int(ch * top_pad), cy1, cy2 - 1)
                 vy2 = clamp(cy2 - int(ch * bottom_pad), vy1 + 1, cy2)
+                cell_x1, cell_y1, cell_x2, cell_y2 = cx1, cy1, cx2, cy2
+            else:
+                cell_x1 = clamp(cx1 + cell_pad_px, cx1, cx2 - 1)
+                cell_y1 = clamp(cy1 + cell_pad_px, cy1, cy2 - 1)
+                cell_x2 = clamp(cx2 - cell_pad_px, cell_x1 + 1, cx2)
+                cell_y2 = clamp(cy2 - cell_pad_px, cell_y1 + 1, cy2)
+
+                inner_w = max(cell_x2 - cell_x1, 1)
+                inner_h = max(cell_y2 - cell_y1, 1)
+
+                slice_x1_ratio = min(value_x1_ratio, value_x2_ratio)
+                slice_x2_ratio = max(value_x1_ratio, value_x2_ratio)
+                slice_y1_ratio = min(value_y1_ratio, value_y2_ratio)
+                slice_y2_ratio = max(value_y1_ratio, value_y2_ratio)
+
+                vx1 = cell_x1 + int(inner_w * slice_x1_ratio)
+                vx2 = cell_x1 + int(inner_w * slice_x2_ratio)
+                vy1 = cell_y1 + int(inner_h * slice_y1_ratio)
+                vy2 = cell_y1 + int(inner_h * slice_y2_ratio)
+
+                vx1 = clamp(vx1, cell_x1, cell_x2 - 1)
+                vy1 = clamp(vy1, cell_y1, cell_y2 - 1)
+                vx2 = clamp(vx2, vx1 + 1, cell_x2)
+                vy2 = clamp(vy2, vy1 + 1, cell_y2)
 
             vital_adjust = adjust_cfg.get(vital) if isinstance(adjust_cfg, dict) else None
             if isinstance(vital_adjust, dict):
@@ -718,6 +746,8 @@ def build_vital_rois(
                 vy2 = clamp(vy2 + _offset_from_adjust(vital_adjust, "dy2", cw, ch), vy1 + 1, cy2)
 
             out[bed][vital] = (vx1, vy1, vx2, vy2)
+            debug_meta[bed]["cell_inner_boxes"][vital] = (cell_x1, cell_y1, cell_x2, cell_y2)
+            debug_meta[bed]["value_rois"][vital] = (vx1, vy1, vx2, vy2)
 
     if return_debug:
         return out, debug_meta
@@ -834,31 +864,34 @@ def run_calibration(
         cv2.createTrackbar(name, win, value, max_value, lambda _v: None)
 
     add_trackbar("header_crop_px", int(config.get("header_crop_px", 60)), max(1, cropped.shape[0] - 1))
-    value_box = config.setdefault("value_box", dict(DEFAULT_CONFIG["value_box"]))
-    add_trackbar("value_x1(%)", int(float(value_box.get("x1_ratio", 0.58)) * 100), 99)
-    add_trackbar("value_x2(%)", int(float(value_box.get("x2_ratio", 0.98)) * 100), 100)
-    add_trackbar("value_y1(%)", int(float(value_box.get("y1_ratio", 0.20)) * 100), 99)
-    add_trackbar("value_y2(%)", int(float(value_box.get("y2_ratio", 0.88)) * 100), 100)
-    add_trackbar("pad_px", int(value_box.get("pad_px", 2)), 20)
+    cell_inner = config.setdefault("cell_inner_box", dict(DEFAULT_CONFIG["cell_inner_box"]))
+    cell_slice = config.setdefault("cell_value_slice", dict(DEFAULT_CONFIG["cell_value_slice"]))
+    add_trackbar("cell_pad_px", int(cell_inner.get("pad_px", 4)), 40)
+    add_trackbar("value_x1_ratio(%)", int(float(cell_slice.get("x1_ratio", 0.50)) * 100), 99)
+    add_trackbar("value_x2_ratio(%)", int(float(cell_slice.get("x2_ratio", 0.98)) * 100), 100)
+    add_trackbar("value_y1_ratio(%)", int(float(cell_slice.get("y1_ratio", 0.12)) * 100), 99)
+    add_trackbar("value_y2_ratio(%)", int(float(cell_slice.get("y2_ratio", 0.90)) * 100), 100)
 
     while True:
         config["header_crop_px"] = cv2.getTrackbarPos("header_crop_px", win)
-        value_x1 = cv2.getTrackbarPos("value_x1(%)", win)
-        value_x2 = cv2.getTrackbarPos("value_x2(%)", win)
-        value_y1 = cv2.getTrackbarPos("value_y1(%)", win)
-        value_y2 = cv2.getTrackbarPos("value_y2(%)", win)
-        config["value_box"]["x1_ratio"] = min(value_x1, value_x2) / 100.0
-        config["value_box"]["x2_ratio"] = max(value_x1, value_x2) / 100.0
-        config["value_box"]["y1_ratio"] = min(value_y1, value_y2) / 100.0
-        config["value_box"]["y2_ratio"] = max(value_y1, value_y2) / 100.0
-        config["value_box"]["pad_px"] = cv2.getTrackbarPos("pad_px", win)
+        value_x1 = cv2.getTrackbarPos("value_x1_ratio(%)", win)
+        value_x2 = cv2.getTrackbarPos("value_x2_ratio(%)", win)
+        value_y1 = cv2.getTrackbarPos("value_y1_ratio(%)", win)
+        value_y2 = cv2.getTrackbarPos("value_y2_ratio(%)", win)
+        config["cell_inner_box"]["pad_px"] = cv2.getTrackbarPos("cell_pad_px", win)
+        config["cell_value_slice"]["x1_ratio"] = min(value_x1, value_x2) / 100.0
+        config["cell_value_slice"]["x2_ratio"] = max(value_x1, value_x2) / 100.0
+        config["cell_value_slice"]["y1_ratio"] = min(value_y1, value_y2) / 100.0
+        config["cell_value_slice"]["y2_ratio"] = max(value_y1, value_y2) / 100.0
 
-        rois = build_vital_rois(cropped, config)
+        rois, roi_debug = build_vital_rois(cropped, config, return_debug=True)
         x1, y1, x2, y2 = rois["BED01"]["RAP_M"]
+        ci_x1, ci_y1, ci_x2, ci_y2 = roi_debug["BED01"]["cell_inner_boxes"]["RAP_M"]
         roi_img = cropped[y1:y2, x1:x2]
         text, conf = run_ocr(reader, preprocess_image(roi_img, config))
 
         left = cropped.copy()
+        cv2.rectangle(left, (ci_x1, ci_y1), (ci_x2, ci_y2), (255, 0, 0), 2)
         cv2.rectangle(left, (x1, y1), (x2, y2), (0, 0, 255), 2)
         cv2.putText(left, f"BED01 RAP_M text={text} conf={conf:.3f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
@@ -1044,7 +1077,13 @@ def main() -> None:
                                 cv2.LINE_AA,
                             )
 
+                            cell_inner_boxes = meta.get("cell_inner_boxes", {})
                             for vital in VITAL_ORDER:
+                                inner = cell_inner_boxes.get(vital)
+                                if isinstance(inner, tuple) and len(inner) == 4:
+                                    ci_x1, ci_y1, ci_x2, ci_y2 = inner
+                                    cv2.rectangle(debug_img, (ci_x1, ci_y1), (ci_x2, ci_y2), (255, 0, 0), 1)
+
                                 x1, y1, x2, y2 = rois[bed][vital]
                                 cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
                         cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
