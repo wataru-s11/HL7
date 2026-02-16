@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import re
@@ -91,6 +92,12 @@ class SnapshotCandidate:
     timestamp: datetime
 
 
+@dataclass
+class SnapshotData:
+    payload: dict[str, Any]
+    truth_map: dict[str, dict[str, Any]]
+
+
 def parse_snapshot_timestamp(path: Path) -> datetime:
     match = SNAPSHOT_FILENAME_PATTERN.search(path.name)
     if match:
@@ -113,6 +120,24 @@ def load_snapshot_candidates(cache_dir: Path) -> list[SnapshotCandidate]:
             continue
     candidates.sort(key=lambda item: item.timestamp)
     return candidates
+
+
+def build_snapshot_timestamps(cache_candidates: list[SnapshotCandidate]) -> list[float]:
+    return [candidate.timestamp.timestamp() for candidate in cache_candidates]
+
+
+def load_snapshot_data(snapshot_path: Path, snapshot_cache: dict[str, SnapshotData]) -> SnapshotData:
+    cache_key = str(snapshot_path)
+    cached = snapshot_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("snapshot is not a JSON object")
+    loaded = SnapshotData(payload=payload, truth_map=extract_truth_map(payload))
+    snapshot_cache[cache_key] = loaded
+    return loaded
 
 
 def ensure_validator_config(path: Path) -> dict[str, Any]:
@@ -246,9 +271,11 @@ def validate_records(
     dump_mismatch: int,
     debug_mismatches: int,
     cache_candidates: list[SnapshotCandidate] | None,
+    cache_candidate_timestamps: list[float] | None,
     lookback_sec: float,
     max_candidates: int,
     lag_sec: float,
+    fallback_to_nearest_past: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]]]:
     details: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -266,7 +293,9 @@ def validate_records(
     snapshot_missing = 0
     snapshot_load_error = 0
     dt_skipped = 0
+    nearest_fallback_used = 0
     dt_skip_reason_counts: Counter[str] = Counter()
+    snapshot_data_cache: dict[str, SnapshotData] = {}
 
     def evaluate_record(
         rec: dict[str, Any],
@@ -403,10 +432,9 @@ def validate_records(
                 print(f"[WARN] explicit_truth_load_failed path={explicit_raw_path} error=not_found")
                 continue
             try:
-                selected_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-                if not isinstance(selected_payload, dict):
-                    raise ValueError("snapshot is not a JSON object")
-                selected_map = extract_truth_map(selected_payload)
+                snapshot_data = load_snapshot_data(snapshot_path, snapshot_data_cache)
+                selected_payload = snapshot_data.payload
+                selected_map = snapshot_data.truth_map
                 selected_snapshot_path = str(snapshot_path)
                 selected_truth_dt = extract_message_datetime(selected_payload)
                 selected_source = f"explicit:{explicit_key}"
@@ -418,31 +446,40 @@ def validate_records(
                 snapshot_load_error += 1
                 print(f"[WARN] explicit_truth_load_failed path={snapshot_path} error={exc}")
 
-        if not explicit_selected and cache_candidates:
+        if not explicit_selected and cache_candidates and cache_candidate_timestamps:
             window_candidates: list[SnapshotCandidate] = []
             if ocr_dt_corrected is not None:
-                for candidate in cache_candidates:
-                    if candidate.timestamp > ocr_dt_corrected:
-                        continue
-                    delta = (ocr_dt_corrected - candidate.timestamp).total_seconds()
-                    if delta <= lookback_sec:
-                        window_candidates.append(candidate)
+                ocr_ts = ocr_dt_corrected.timestamp()
+                end_idx = bisect.bisect_right(cache_candidate_timestamps, ocr_ts)
+                start_idx = end_idx - 1
 
-            window_candidates.sort(key=lambda item: (ocr_dt_corrected - item.timestamp).total_seconds() if ocr_dt_corrected else 0.0)
+                while start_idx >= 0:
+                    candidate = cache_candidates[start_idx]
+                    delta = ocr_ts - cache_candidate_timestamps[start_idx]
+                    if delta > lookback_sec:
+                        break
+                    window_candidates.append(candidate)
+                    if max_candidates > 0 and len(window_candidates) >= max_candidates:
+                        break
+                    start_idx -= 1
+
+                if not window_candidates and fallback_to_nearest_past and end_idx > 0:
+                    nearest_fallback_used += 1
+                    window_candidates = [cache_candidates[end_idx - 1]]
+
             if max_candidates > 0:
                 window_candidates = window_candidates[:max_candidates]
             selected_candidate_count = len(window_candidates)
 
             for candidate in window_candidates:
                 try:
-                    truth_payload = json.loads(candidate.path.read_text(encoding="utf-8"))
-                    if not isinstance(truth_payload, dict):
-                        raise ValueError("snapshot is not a JSON object")
+                    snapshot_data = load_snapshot_data(candidate.path, snapshot_data_cache)
+                    truth_payload = snapshot_data.payload
                 except Exception as exc:  # noqa: BLE001
                     print(f"[WARN] failed to load snapshot {candidate.path}: {exc}")
                     continue
 
-                truth_map = extract_truth_map(truth_payload)
+                truth_map = snapshot_data.truth_map
                 per_item, score, _, _, _ = evaluate_record(
                     rec=rec,
                     truth_map=truth_map,
@@ -547,6 +584,7 @@ def validate_records(
         "fallback_used": float(fallback_used),
         "snapshot_missing": float(snapshot_missing),
         "snapshot_load_error": float(snapshot_load_error),
+        "nearest_fallback_used": float(nearest_fallback_used),
         "dt_mean_seconds": (sum(dt_seconds) / len(dt_seconds)) if dt_seconds else 0.0,
         "dt_median_seconds": statistics.median(dt_seconds) if dt_seconds else 0.0,
         "dt_p90_seconds": percentile(dt_seconds, 0.9) if dt_seconds else 0.0,
@@ -588,6 +626,18 @@ def main() -> None:
     parser.add_argument("--lookback-sec", type=float, default=12.0, help="Search lookback window in seconds (past only)")
     parser.add_argument("--max-candidates", type=int, default=40, help="Max candidate snapshots to evaluate per OCR record")
     parser.add_argument("--lag-sec", type=float, default=0.0, help="Timestamp correction applied to OCR timestamp")
+    parser.add_argument(
+        "--fallback-to-nearest-past",
+        action="store_true",
+        default=True,
+        help="If no snapshot exists within lookback window, evaluate nearest past snapshot",
+    )
+    parser.add_argument(
+        "--no-fallback-to-nearest-past",
+        action="store_false",
+        dest="fallback_to_nearest_past",
+        help="Disable nearest-past fallback when lookback search returns empty",
+    )
     parser.add_argument(
         "--auto-lag",
         action="store_true",
@@ -632,6 +682,9 @@ def main() -> None:
         cache_dir = Path(args.cache_dir)
         cache_candidates = load_snapshot_candidates(cache_dir)
         print(f"[INFO] cache_candidates_loaded={len(cache_candidates)} from={cache_dir}")
+    cache_candidate_timestamps = (
+        build_snapshot_timestamps(cache_candidates) if cache_candidates else None
+    )
 
     lookback_sec = args.lookback_sec
     if args.time_window_sec != 10.0 and args.lookback_sec == 12.0:
@@ -652,9 +705,11 @@ def main() -> None:
                 dump_mismatch=0,
                 debug_mismatches=0,
                 cache_candidates=cache_candidates,
+                cache_candidate_timestamps=cache_candidate_timestamps,
                 lookback_sec=lookback_sec,
                 max_candidates=args.max_candidates,
                 lag_sec=lag,
+                fallback_to_nearest_past=args.fallback_to_nearest_past,
             )
             score = (lag_metrics["match_rate"], lag_metrics["mean_abs_error"], lag_metrics["dt_mean_seconds"])
             if score[0] > best_score[0] or (score[0] == best_score[0] and score[1] < best_score[1]):
@@ -672,9 +727,11 @@ def main() -> None:
         dump_mismatch=args.dump_mismatch,
         debug_mismatches=args.debug_mismatches,
         cache_candidates=cache_candidates,
+        cache_candidate_timestamps=cache_candidate_timestamps,
         lookback_sec=lookback_sec,
         max_candidates=args.max_candidates,
         lag_sec=selected_lag,
+        fallback_to_nearest_past=args.fallback_to_nearest_past,
     )
 
     output_path = ocr_path.parent / "validation_results.jsonl"
@@ -691,6 +748,7 @@ def main() -> None:
         f"explicit_used={int(metrics['explicit_used'])} "
         f"snapshot_used={int(metrics['snapshot_used'])} "
         f"fallback_used={int(metrics['fallback_used'])} "
+        f"nearest_fallback_used={int(metrics['nearest_fallback_used'])} "
         f"snapshot_missing={int(metrics['snapshot_missing'])} "
         f"snapshot_load_error={int(metrics['snapshot_load_error'])}"
     )
