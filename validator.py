@@ -244,6 +244,7 @@ def validate_records(
     ocr_results_path: Path,
     tolerances: dict[str, Any],
     dump_mismatch: int,
+    debug_mismatches: int,
     cache_candidates: list[SnapshotCandidate] | None,
     lookback_sec: float,
     max_candidates: int,
@@ -259,6 +260,7 @@ def validate_records(
     matched = 0
     missing = 0
     invalid = 0
+    explicit_used = 0
     snapshot_used = 0
     fallback_used = 0
     snapshot_missing = 0
@@ -359,6 +361,7 @@ def validate_records(
                             "confidence": confidence,
                             "image_path": rec.get("image_path"),
                             "cache_snapshot_path": rec.get("cache_snapshot_path"),
+                            "truth_snapshot_used": None,
                         }
                     )
 
@@ -379,13 +382,43 @@ def validate_records(
         selected_snapshot_path: str | None = None
         selected_truth_dt: datetime | None = None
         selected_source = "monitor_cache_fallback"
+        selected_dt_source = "none"
         selected_candidate_count = 0
 
         chosen_per_item: list[dict[str, Any]] = []
         chosen_score = {"matched": -1.0, "mean_abs_error": float("inf"), "delta": float("inf")}
         chosen_dt_sec: float | None = None
 
-        if cache_candidates:
+        explicit_candidates = [
+            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
+            ("cache_snapshot_path_before", rec.get("cache_snapshot_path_before")),
+        ]
+        explicit_selected = False
+        for explicit_key, explicit_raw_path in explicit_candidates:
+            if explicit_raw_path is None:
+                continue
+            snapshot_path = resolve_snapshot_path(explicit_raw_path, ocr_results_path)
+            if snapshot_path is None:
+                snapshot_missing += 1
+                print(f"[WARN] explicit_truth_load_failed path={explicit_raw_path} error=not_found")
+                continue
+            try:
+                selected_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                if not isinstance(selected_payload, dict):
+                    raise ValueError("snapshot is not a JSON object")
+                selected_map = extract_truth_map(selected_payload)
+                selected_snapshot_path = str(snapshot_path)
+                selected_truth_dt = extract_message_datetime(selected_payload)
+                selected_source = f"explicit:{explicit_key}"
+                selected_dt_source = "explicit_path"
+                explicit_used += 1
+                explicit_selected = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                snapshot_load_error += 1
+                print(f"[WARN] explicit_truth_load_failed path={snapshot_path} error={exc}")
+
+        if not explicit_selected and cache_candidates:
             window_candidates: list[SnapshotCandidate] = []
             if ocr_dt_corrected is not None:
                 for candidate in cache_candidates:
@@ -442,36 +475,19 @@ def validate_records(
                     selected_snapshot_path = str(candidate.path)
                     selected_truth_dt = candidate.timestamp
                     selected_source = "cache_dir_search"
+                    selected_dt_source = "cache_search"
 
             if selected_snapshot_path is not None:
                 snapshot_used += 1
 
-        if not cache_candidates or selected_snapshot_path is None:
-            snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path_before"), ocr_results_path)
-            if snapshot_path is None:
-                snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path"), ocr_results_path)
-            if snapshot_path is None:
-                snapshot_missing += 1
-                fallback_used += 1
-            else:
-                try:
-                    selected_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-                    if not isinstance(selected_payload, dict):
-                        raise ValueError("snapshot is not a JSON object")
-                    selected_map = extract_truth_map(selected_payload)
-                    selected_snapshot_path = str(snapshot_path)
-                    selected_truth_dt = parse_snapshot_timestamp(snapshot_path)
-                    selected_source = "snapshot"
-                    snapshot_used += 1
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[WARN] failed to load snapshot {snapshot_path}: {exc}")
-                    snapshot_load_error += 1
-                    fallback_used += 1
-                    selected_payload = monitor_cache_payload
-                    selected_map = monitor_truth
-                    selected_snapshot_path = None
-                    selected_truth_dt = None
-                    selected_source = "monitor_cache_fallback"
+        if not explicit_selected and (not cache_candidates or selected_snapshot_path is None):
+            fallback_used += 1
+            selected_payload = monitor_cache_payload
+            selected_map = monitor_truth
+            selected_snapshot_path = None
+            selected_truth_dt = None
+            selected_source = "monitor_cache_fallback"
+            selected_dt_source = "monitor_cache"
 
         per_item, score, record_mismatches, dt_sec, dt_skip_reason = evaluate_record(
             rec=rec,
@@ -481,6 +497,9 @@ def validate_records(
             truth_dt=selected_truth_dt,
             include_mismatch=True,
         )
+        for mismatch_item in record_mismatches:
+            mismatch_item["truth_snapshot_used"] = selected_snapshot_path
+
         chosen_per_item = per_item
         total += int(score["total"])
         matched += int(score["matched"])
@@ -491,6 +510,10 @@ def validate_records(
                     invalid += 1
             elif row["abs_error"] is not None:
                 abs_errors.append(row["abs_error"])
+
+        if selected_dt_source == "explicit_path" and dt_sec is None:
+            dt_sec = 0.0
+            dt_skip_reason = None
 
         if dt_sec is not None:
             dt_seconds.append(abs(dt_sec))
@@ -506,6 +529,7 @@ def validate_records(
                 "truth_source": selected_source,
                 "truth_snapshot_used": selected_snapshot_path,
                 "delta_t_seconds": dt_sec,
+                "dt_source": selected_dt_source,
                 "candidate_count": selected_candidate_count,
                 "comparisons": chosen_per_item,
             }
@@ -518,6 +542,7 @@ def validate_records(
         "median_abs_error": statistics.median(abs_errors) if abs_errors else 0.0,
         "missing_rate": (missing / total) if total else 0.0,
         "invalid_rate": (invalid / total) if total else 0.0,
+        "explicit_used": float(explicit_used),
         "snapshot_used": float(snapshot_used),
         "fallback_used": float(fallback_used),
         "snapshot_missing": float(snapshot_missing),
@@ -530,9 +555,10 @@ def validate_records(
         "dt_skip_reason_counts": dict(dt_skip_reason_counts),
     }
 
-    if dump_mismatch > 0:
+    max_mismatches = max(dump_mismatch, debug_mismatches)
+    if max_mismatches > 0:
         mismatches.sort(key=lambda item: item["_sort_error"], reverse=True)
-        mismatches = mismatches[:dump_mismatch]
+        mismatches = mismatches[:max_mismatches]
     else:
         mismatches = []
 
@@ -573,6 +599,12 @@ def main() -> None:
         type=int,
         default=0,
         help="Print top-N mismatch rows (bed/vital/value/confidence/path)",
+    )
+    parser.add_argument(
+        "--debug-mismatches",
+        type=int,
+        default=0,
+        help="Print top-N mismatching fields with OCR vs truth and selected truth snapshot",
     )
     args = parser.parse_args()
 
@@ -618,6 +650,7 @@ def main() -> None:
                 ocr_results_path=ocr_path,
                 tolerances=tolerances,
                 dump_mismatch=0,
+                debug_mismatches=0,
                 cache_candidates=cache_candidates,
                 lookback_sec=lookback_sec,
                 max_candidates=args.max_candidates,
@@ -637,6 +670,7 @@ def main() -> None:
         ocr_results_path=ocr_path,
         tolerances=tolerances,
         dump_mismatch=args.dump_mismatch,
+        debug_mismatches=args.debug_mismatches,
         cache_candidates=cache_candidates,
         lookback_sec=lookback_sec,
         max_candidates=args.max_candidates,
@@ -654,6 +688,7 @@ def main() -> None:
     print(f"[INFO] invalid_rate={metrics['invalid_rate']:.4f}")
     print(
         "[INFO] truth_source_stats "
+        f"explicit_used={int(metrics['explicit_used'])} "
         f"snapshot_used={int(metrics['snapshot_used'])} "
         f"fallback_used={int(metrics['fallback_used'])} "
         f"snapshot_missing={int(metrics['snapshot_missing'])} "
@@ -670,14 +705,27 @@ def main() -> None:
     print(f"[INFO] dt_skip_reason_counts={metrics.get('dt_skip_reason_counts', {})}")
 
     if args.dump_mismatch > 0:
-        print(f"[INFO] dump_mismatch_top={len(mismatches)}")
-        for idx, item in enumerate(mismatches, start=1):
+        dump_rows = mismatches[: args.dump_mismatch]
+        print(f"[INFO] dump_mismatch_top={len(dump_rows)}")
+        for idx, item in enumerate(dump_rows, start=1):
             print(
                 f"[MISMATCH {idx}] "
                 f"bed={item['bed']} vital={item['vital']} "
                 f"ocr_value={item['ocr_value']} truth_value={item['truth_value']} "
                 f"abs_error={item['abs_error']} confidence={item['confidence']} "
                 f"image_path={item['image_path']} cache_snapshot_path={item['cache_snapshot_path']}"
+            )
+
+    if args.debug_mismatches > 0:
+        debug_rows = mismatches[: args.debug_mismatches]
+        print(f"[INFO] debug_mismatches_top={len(debug_rows)}")
+        for idx, item in enumerate(debug_rows, start=1):
+            print(
+                f"[DEBUG_MISMATCH {idx}] "
+                f"bed={item['bed']} vital={item['vital']} "
+                f"ocr_value={item['ocr_value']} truth_value={item['truth_value']} "
+                f"truth_snapshot_used={item.get('truth_snapshot_used')} "
+                f"abs_error={item['abs_error']} image_path={item['image_path']}"
             )
 
 
