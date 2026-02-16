@@ -63,19 +63,24 @@ JST = timezone(timedelta(hours=9))
 def parse_iso8601(value: Any) -> datetime | None:
     if value is None:
         return None
+
     text = str(value).strip()
     if not text:
         return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    if " " in text and "T" not in text:
-        text = text.replace(" ", "T", 1)
+
+    normalized = text
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    if " " in normalized and "T" not in normalized:
+        normalized = normalized.replace(" ", "T", 1)
+
     try:
-        dt = datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(normalized)
     except ValueError:
         return None
+
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=JST)
+        return dt.replace(tzinfo=JST)
     return dt
 SNAPSHOT_FILENAME_PATTERN = re.compile(r"(\d{8})_(\d{6})_(\d{3})_monitor_cache\.json$")
 
@@ -180,7 +185,7 @@ def extract_truth_map(truth_json: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def extract_message_datetime(truth_json: dict[str, Any]) -> datetime | None:
-    for key in ("message_datetime", "timestamp", "captured_at"):
+    for key in ("message_datetime", "timestamp", "captured_at", "updated_at"):
         dt = parse_iso8601(truth_json.get(key))
         if dt is not None:
             return dt
@@ -190,6 +195,15 @@ def extract_message_datetime(truth_json: dict[str, Any]) -> datetime | None:
         dt = parse_iso8601(meta.get("message_datetime"))
         if dt is not None:
             return dt
+
+    beds = truth_json.get("beds")
+    if isinstance(beds, dict):
+        for bed_payload in beds.values():
+            if not isinstance(bed_payload, dict):
+                continue
+            dt = parse_iso8601(bed_payload.get("message_datetime"))
+            if dt is not None:
+                return dt
 
     return None
 
