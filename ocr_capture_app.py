@@ -55,10 +55,35 @@ VITAL_ORDER = [
     "BSR1",
     "BSR2",
 ]
-NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
-ALLOWLIST = "0123456789.-"
+NUMERIC_RE = re.compile(r"^\d+(\.\d+)?$")
+ALLOWLIST = "0123456789."
 MONITORINFOF_PRIMARY = 0x00000001
 ROI_MAP_PATH = Path("dataset/layout/monitor_roi_map.json")
+
+TEMPERATURE_VITALS = {"TSKIN", "TRECT"}
+INTEGER_PREFERRED_VITALS = {"HR", "SpO2", "RR", "rRESP", "EtCO2", "Ppeak", "PEEP", "O2conc", "NO", "BSR1", "BSR2"}
+DEFAULT_VITAL_RANGES: dict[str, tuple[float, float]] = {
+    "TSKIN": (30.0, 45.0),
+    "TRECT": (30.0, 45.0),
+    "HR": (30.0, 250.0),
+    "SpO2": (30.0, 100.0),
+    "ART_S": (0.0, 250.0),
+    "ART_D": (0.0, 250.0),
+    "ART_M": (0.0, 250.0),
+    "CVP_M": (0.0, 30.0),
+    "RAP_M": (0.0, 30.0),
+    "rRESP": (0.0, 80.0),
+    "EtCO2": (0.0, 120.0),
+    "RR": (0.0, 80.0),
+    "VTe": (0.0, 2000.0),
+    "VTi": (0.0, 2000.0),
+    "Ppeak": (0.0, 80.0),
+    "PEEP": (0.0, 40.0),
+    "O2conc": (0.0, 100.0),
+    "NO": (0.0, 100.0),
+    "BSR1": (0.0, 100.0),
+    "BSR2": (0.0, 100.0),
+}
 
 
 class RECT(ctypes.Structure):
@@ -100,7 +125,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # MOD: vital別ROI微調整設定を追加（px/ratioの両対応）
     "per_vital_roi_adjust": {},
-    "preprocess": {"grayscale": True, "resize": 2.0, "threshold": False, "threshold_value": 160},
+    "preprocess": {
+        "resize": 2.5,
+        "trim_px": 3,
+        "threshold_mode": "adaptive",
+        "adaptive_block_size": 31,
+        "adaptive_c": 2,
+        "morph_kernel": 2,
+    },
+    "vital_ranges": DEFAULT_VITAL_RANGES,
 }
 
 
@@ -458,6 +491,8 @@ def ensure_config(path: Path) -> dict[str, Any]:
     pp_cfg = config.get("preprocess", {})
     if "resize" not in pp_cfg and "scale" in pp_cfg:
         pp_cfg["resize"] = pp_cfg.get("scale")
+    if "threshold" in pp_cfg and "threshold_mode" not in pp_cfg:
+        pp_cfg["threshold_mode"] = "otsu" if pp_cfg.get("threshold") else "adaptive"
     config["value_roi"] = roi_cfg
     vb_cfg = dict(DEFAULT_CONFIG.get("value_box", {}))
     vb_cfg.update(config.get("value_box", {}) if isinstance(config.get("value_box"), dict) else {})
@@ -470,6 +505,11 @@ def ensure_config(path: Path) -> dict[str, Any]:
     config["cell_value_slice"] = cell_slice_cfg
     config["preprocess"] = pp_cfg
     config.setdefault("per_vital_roi_adjust", {})
+    ranges = dict(DEFAULT_VITAL_RANGES)
+    loaded_ranges = config.get("vital_ranges")
+    if isinstance(loaded_ranges, dict):
+        ranges.update(loaded_ranges)
+    config["vital_ranges"] = ranges
     return config
 
 
@@ -623,39 +663,115 @@ def get_monitor_rect(config: dict[str, Any], fallback: CaptureRegion) -> Capture
     return fallback
 
 
-def preprocess_image(img: np.ndarray, config: dict[str, Any]) -> np.ndarray:
-    pp = config.get("preprocess", {})
-    out: np.ndarray = img
-    if pp.get("grayscale", True):
-        out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-    if pp.get("threshold", False):
-        _, out = cv2.threshold(out, int(pp.get("threshold_value", 160)), 255, cv2.THRESH_BINARY)
-    resize = float(pp.get("resize", 2.0))
+def preprocess_roi(img: np.ndarray, vital_name: str, config: dict[str, Any], variant: str = "normal") -> np.ndarray:
+    pp = config.get("preprocess", {}) if isinstance(config.get("preprocess"), dict) else {}
+    out: np.ndarray = img.copy()
+
+    resize = float(pp.get("resize", 2.5))
+    if vital_name in TEMPERATURE_VITALS:
+        resize = max(resize, 3.0)
     if resize > 1.0:
         out = cv2.resize(out, None, fx=resize, fy=resize, interpolation=cv2.INTER_CUBIC)
+
+    if out.ndim == 3:
+        out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+
+    trim_px = int(pp.get("trim_px", 3))
+    if vital_name in TEMPERATURE_VITALS:
+        trim_px = max(trim_px, 2)
+    max_trim = max(min(out.shape[0], out.shape[1]) // 4, 0)
+    trim_px = clamp(trim_px, 0, max_trim)
+    if trim_px > 0 and out.shape[0] > trim_px * 2 and out.shape[1] > trim_px * 2:
+        out = out[trim_px:-trim_px, trim_px:-trim_px]
+
+    threshold_mode = str(pp.get("threshold_mode", "adaptive")).lower()
+    if variant == "otsu" or threshold_mode == "otsu":
+        _, out = cv2.threshold(out, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        block_size = int(pp.get("adaptive_block_size", 31))
+        if block_size % 2 == 0:
+            block_size += 1
+        block_size = max(block_size, 3)
+        c_value = int(pp.get("adaptive_c", 2))
+        out = cv2.adaptiveThreshold(out, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, c_value)
+
+    kernel_size = int(pp.get("morph_kernel", 2))
+    if kernel_size > 0:
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel)
+        out = cv2.morphologyEx(out, cv2.MORPH_OPEN, kernel)
+
+    if variant == "invert":
+        out = cv2.bitwise_not(out)
+
+    if np.mean(out) < 127:
+        out = cv2.bitwise_not(out)
+
     return out
 
 
-def run_ocr(reader: easyocr.Reader, roi_image: np.ndarray) -> tuple[str, float]:
-    results = reader.readtext(roi_image, detail=1, paragraph=False, allowlist=ALLOWLIST)
-    if not results:
-        return "", 0.0
-    best_text, best_conf = "", -1.0
-    for _, text, conf in results:
-        filtered = "".join(ch for ch in str(text) if ch in ALLOWLIST)
-        if filtered and conf > best_conf:
-            best_text, best_conf = filtered, float(conf)
-    return ("", 0.0) if best_conf < 0 else (best_text, best_conf)
+def _sanitize_numeric_text(text: str) -> str:
+    sanitized = "".join(ch for ch in str(text) if ch in ALLOWLIST)
+    if sanitized.count(".") > 1:
+        head, *tail = sanitized.split(".")
+        sanitized = head + "." + "".join(tail)
+    return sanitized
 
 
-def parse_value(text: str) -> float | None:
-    text = text.strip()
-    if not text or NUMERIC_RE.match(text) is None:
-        return None
+def _is_in_range(value: float, vital_name: str, config: dict[str, Any]) -> bool:
+    ranges = config.get("vital_ranges", {}) if isinstance(config.get("vital_ranges"), dict) else {}
+    bounds = ranges.get(vital_name, DEFAULT_VITAL_RANGES.get(vital_name))
+    if not bounds:
+        return True
     try:
-        return float(text)
-    except ValueError:
+        low, high = float(bounds[0]), float(bounds[1])
+    except Exception:
+        return True
+    return low <= value <= high
+
+
+def parse_numeric(text: str, vital_name: str, config: dict[str, Any]) -> float | None:
+    sanitized = _sanitize_numeric_text(text.strip())
+    if not sanitized:
         return None
+
+    candidate_texts = [sanitized]
+    if vital_name in TEMPERATURE_VITALS and "." not in sanitized and sanitized.isdigit() and len(sanitized) == 3:
+        candidate_texts.insert(0, f"{sanitized[:2]}.{sanitized[2]}")
+
+    for candidate in candidate_texts:
+        if NUMERIC_RE.match(candidate) is None:
+            continue
+        try:
+            value = float(candidate)
+        except ValueError:
+            continue
+
+        if vital_name in INTEGER_PREFERRED_VITALS:
+            value = float(int(round(value)))
+
+        if _is_in_range(value, vital_name, config):
+            return value
+    return None
+
+
+def run_ocr(reader: easyocr.Reader, roi_image: np.ndarray, vital_name: str, config: dict[str, Any]) -> tuple[str, float, list[tuple[str, np.ndarray]]]:
+    variants = ["normal", "invert", "otsu"] if vital_name in TEMPERATURE_VITALS else ["normal", "otsu"]
+    best_text, best_conf = "", -1.0
+    debug_images: list[tuple[str, np.ndarray]] = []
+
+    for variant in variants:
+        processed = preprocess_roi(roi_image, vital_name, config, variant=variant)
+        debug_images.append((variant, processed))
+        results = reader.readtext(processed, detail=1, paragraph=False, allowlist=ALLOWLIST)
+        for _, text, conf in results:
+            filtered = _sanitize_numeric_text(text)
+            if filtered and conf > best_conf:
+                best_text, best_conf = filtered, float(conf)
+
+    if best_conf < 0:
+        return "", 0.0, debug_images
+    return best_text, best_conf, debug_images
 
 
 def _offset_from_adjust(adjust: dict[str, Any], key: str, cell_w: int, cell_h: int) -> int:
@@ -1194,7 +1310,7 @@ def run_calibration(
         x1, y1, x2, y2 = rois["BED01"]["RAP_M"]
         ci_x1, ci_y1, ci_x2, ci_y2 = roi_debug["BED01"]["cell_inner_boxes"]["RAP_M"]
         roi_img = cropped[y1:y2, x1:x2]
-        text, conf = run_ocr(reader, preprocess_image(roi_img, config))
+        text, conf, _ = run_ocr(reader, roi_img, "RAP_M", config)
 
         left = cropped.copy()
         cv2.rectangle(left, (ci_x1, ci_y1), (ci_x2, ci_y2), (255, 0, 0), 2)
@@ -1447,8 +1563,14 @@ def main() -> None:
                                 continue
                             x1, y1, x2, y2 = roi_box
                             roi = frame[y1:y2, x1:x2]
-                            text, conf = run_ocr(reader, preprocess_image(roi, config))
-                            beds[bed][vital] = {"text": text, "value": parse_value(text), "confidence": conf}
+                            text, conf, debug_variants = run_ocr(reader, roi, vital, config)
+                            value = parse_numeric(text, vital, config)
+                            beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
+
+                            if args.debug_roi:
+                                for variant_name, variant_img in debug_variants:
+                                    roi_debug_path = debug_dir / f"{stamp}_roi_{bed}_{vital}_{variant_name}.png"
+                                    cv2.imwrite(str(roi_debug_path), variant_img)
 
                     cache_snapshot = copy_cache_snapshot(cache_path, day_dir, stamp)
                     if not cache_snapshot:
