@@ -4,7 +4,7 @@ OCR capture application.
 
 Usage examples:
   # 1) One-time calibration (adjust ROI and save config)
-  python ocr_capture_app.py --calibrate --config ocr_capture_config.json --monitor-index 2
+  python ocr_capture_app.py --calibrate --config ocr_capture_config.json --target-display primary
 
   # 2) Periodic capture (10s interval)
   python ocr_capture_app.py --config ocr_capture_config.json --interval-ms 10000 --save-images true --debug-roi false
@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from ctypes import wintypes
 
 import cv2
 import easyocr
@@ -61,6 +62,15 @@ VITAL_ORDER = [
 ]
 NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
 ALLOWLIST = "0123456789.-"
+MONITORINFOF_PRIMARY = 0x00000001
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "window_title": "HL7 Bed Monitor",
@@ -96,7 +106,7 @@ class CaptureRegion:
     height: int
 
 
-def set_windows_dpi_awareness() -> None:
+def dpi_aware() -> None:
     if not sys.platform.startswith("win"):
         return
     try:
@@ -110,6 +120,157 @@ def set_windows_dpi_awareness() -> None:
         print("[INFO] DPI awareness enabled via SetProcessDPIAware()")
     except Exception as exc:
         print(f"[WARN] SetProcessDPIAware() failed: {exc}", file=sys.stderr)
+
+
+def enum_windows_monitors() -> list[dict[str, int | bool]]:
+    if not sys.platform.startswith("win"):
+        print("[WARN] Windows monitor enumeration is only available on Windows", file=sys.stderr)
+        return []
+
+    monitors: list[dict[str, int | bool]] = []
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    callback_type = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(RECT),
+        wintypes.LPARAM,
+    )
+
+    def callback(hmonitor, _hdc, _lprc, _lparam):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        ok = user32.GetMonitorInfoW(hmonitor, ctypes.byref(info))
+        if not ok:
+            print(f"[WARN] GetMonitorInfoW failed for hmonitor={hmonitor}", file=sys.stderr)
+            return 1
+
+        left = int(info.rcMonitor.left)
+        top = int(info.rcMonitor.top)
+        width = int(info.rcMonitor.right - info.rcMonitor.left)
+        height = int(info.rcMonitor.bottom - info.rcMonitor.top)
+        is_primary = bool(info.dwFlags & MONITORINFOF_PRIMARY)
+        index = len(monitors) + 1
+        monitors.append(
+            {
+                "index": index,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "is_primary": is_primary,
+            }
+        )
+        print(
+            "[INFO] monitor "
+            f"index={index} left={left} top={top} width={width} height={height} is_primary={is_primary}"
+        )
+        return 1
+
+    try:
+        user32.EnumDisplayMonitors(0, 0, callback_type(callback), 0)
+    except Exception as exc:
+        print(f"[WARN] EnumDisplayMonitors failed: {exc}", file=sys.stderr)
+        return []
+    return monitors
+
+
+def pick_primary_monitor(monitors: list[dict[str, int | bool]]) -> dict[str, int | bool] | None:
+    for monitor in monitors:
+        if bool(monitor.get("is_primary", False)):
+            return monitor
+    print("[WARN] Primary monitor not found", file=sys.stderr)
+    return monitors[0] if monitors else None
+
+
+def resolve_mss_monitor_index(
+    sct: mss.mss,
+    target_display: str,
+    windows_monitors: list[dict[str, int | bool]],
+    display_index: int | None,
+    mss_monitor_index: int | None,
+) -> int:
+    monitor_count = len(sct.monitors) - 1
+    if monitor_count <= 0:
+        raise RuntimeError("No mss monitors available")
+
+    if target_display == "mss":
+        selected = int(mss_monitor_index or 1)
+        if selected < 1 or selected > monitor_count:
+            print(f"[WARN] invalid mss-monitor-index={selected}; fallback to 1", file=sys.stderr)
+            selected = 1
+        monitor = sct.monitors[selected]
+        print(
+            "[INFO] target-display=mss resolved "
+            f"mss-monitor-index={selected} rect=({monitor['left']},{monitor['top']},{monitor['width']},{monitor['height']})"
+        )
+        return selected
+
+    if target_display == "index":
+        selected_window = None
+        for monitor in windows_monitors:
+            if int(monitor.get("index", 0)) == int(display_index or 1):
+                selected_window = monitor
+                break
+        if selected_window is None:
+            print(f"[WARN] display-index={display_index} not found; fallback to primary", file=sys.stderr)
+            selected_window = pick_primary_monitor(windows_monitors)
+        if selected_window is None:
+            return 1
+        rect = (
+            int(selected_window["left"]),
+            int(selected_window["top"]),
+            int(selected_window["width"]),
+            int(selected_window["height"]),
+        )
+        best_idx = 1
+        best_dist = None
+        for idx in range(1, monitor_count + 1):
+            mon = sct.monitors[idx]
+            dist = abs(mon["left"] - rect[0]) + abs(mon["top"] - rect[1]) + abs(mon["width"] - rect[2]) + abs(mon["height"] - rect[3])
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        mon = sct.monitors[best_idx]
+        print(
+            "[INFO] target-display=index resolved "
+            f"display-index={selected_window['index']} mss-monitor-index={best_idx} "
+            f"rect=({mon['left']},{mon['top']},{mon['width']},{mon['height']})"
+        )
+        return best_idx
+
+    primary = pick_primary_monitor(windows_monitors)
+    if primary is None:
+        print("[WARN] fallback primary monitor unavailable; using mss index=1", file=sys.stderr)
+        return 1
+
+    primary_rect = (
+        int(primary["left"]),
+        int(primary["top"]),
+        int(primary["width"]),
+        int(primary["height"]),
+    )
+    exact_match = None
+    best_idx = 1
+    best_dist = None
+    for idx in range(1, monitor_count + 1):
+        mon = sct.monitors[idx]
+        current_rect = (int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"]))
+        if current_rect == primary_rect:
+            exact_match = idx
+            break
+        dist = abs(current_rect[0] - primary_rect[0]) + abs(current_rect[1] - primary_rect[1]) + abs(current_rect[2] - primary_rect[2]) + abs(current_rect[3] - primary_rect[3])
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+
+    selected = exact_match if exact_match is not None else best_idx
+    mon = sct.monitors[selected]
+    print(
+        "[INFO] target-display=primary resolved "
+        f"mss-monitor-index={selected} rect=({mon['left']},{mon['top']},{mon['width']},{mon['height']})"
+    )
+    return selected
 
 
 def log_windows_dpi_info() -> None:
@@ -243,35 +404,19 @@ def log_monitors(sct: mss.mss) -> None:
 
 def choose_capture_region(
     sct: mss.mss,
-    config: dict[str, Any],
-    monitor_index: int,
+    target_display: str,
+    windows_monitors: list[dict[str, int | bool]],
+    display_index: int | None,
     mss_monitor_index: int | None,
 ) -> CaptureRegion:
-    monitor_count = len(sct.monitors) - 1
-
-    # MOD: --mss-monitor-index指定時はwindow_titleを無視してmonitor領域を直接使用
-    if mss_monitor_index is not None:
-        selected = mss_monitor_index
-        if selected < 1 or selected > monitor_count:
-            print(f"[WARN] invalid mss_monitor_index={selected}; fallback to monitor 1", file=sys.stderr)
-            selected = 1
-        monitor = sct.monitors[selected]
-        print(f"[INFO] explicit mss monitor capture selected: index={selected} (window_title ignored)")
-        return CaptureRegion(int(monitor["left"]), int(monitor["top"]), int(monitor["width"]), int(monitor["height"]))
-
-    title = str(config.get("window_title", "HL7 Bed Monitor"))
-    win_region = find_window_region(title)
-    if win_region:
-        print(f"[INFO] window-title capture selected: {title}")
-        return win_region
-
-    selected = monitor_index
-    if selected < 1 or selected > monitor_count:
-        print(f"[WARN] invalid monitor_index={monitor_index}; fallback to monitor 1", file=sys.stderr)
-        selected = 1
-
+    selected = resolve_mss_monitor_index(
+        sct=sct,
+        target_display=target_display,
+        windows_monitors=windows_monitors,
+        display_index=display_index,
+        mss_monitor_index=mss_monitor_index,
+    )
     monitor = sct.monitors[selected]
-    print(f"[INFO] monitor-index capture selected: index={selected}")
     return CaptureRegion(int(monitor["left"]), int(monitor["top"]), int(monitor["width"]), int(monitor["height"]))
 
 
@@ -559,11 +704,13 @@ def run_calibration(
     sct: mss.mss,
     config_path: Path,
     config: dict[str, Any],
-    monitor_index: int,
+    target_display: str,
+    windows_monitors: list[dict[str, int | bool]],
+    display_index: int | None,
     mss_monitor_index: int | None,
     use_gpu: bool,
 ) -> None:
-    base = choose_capture_region(sct, config, monitor_index, mss_monitor_index)
+    base = choose_capture_region(sct, target_display, windows_monitors, display_index, mss_monitor_index)
     frame = grab_frame(sct, base)
     base_img_h, base_img_w = frame.shape[:2]
     base_scale_x = base_img_w / float(max(base.width, 1))
@@ -590,7 +737,7 @@ def run_calibration(
     logical_w = max(_scale_value(w, inv_scale_x), 1)
     logical_h = max(_scale_value(h, inv_scale_y), 1)
 
-    config["monitor_index"] = monitor_index
+    config["target_display"] = target_display
     config["monitor_rect"] = {
         "left": base.left + logical_x,
         "top": base.top + logical_y,
@@ -670,8 +817,9 @@ def main() -> None:
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--config", default="ocr_capture_config.json")
     parser.add_argument("--outdir", default="dataset")
-    parser.add_argument("--monitor-index", type=int, default=2)
-    parser.add_argument("--mss-monitor-index", type=int, default=None)  # MOD
+    parser.add_argument("--target-display", choices=["primary", "index", "mss"], default="primary")
+    parser.add_argument("--display-index", type=int, default=None)
+    parser.add_argument("--mss-monitor-index", type=int, default=None)
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
@@ -683,7 +831,7 @@ def main() -> None:
     parser.add_argument("--calibrate", action="store_true")
     args = parser.parse_args()
 
-    set_windows_dpi_awareness()
+    dpi_aware()
     log_windows_dpi_info()
 
     config_path = Path(args.config)
@@ -703,15 +851,34 @@ def main() -> None:
 
     launched_monitor = maybe_launch_monitor(args.no_launch_monitor, cache_path)
 
+    windows_monitors = enum_windows_monitors()
+    if args.target_display in {"primary", "index", "mss"}:
+        print(f"[INFO] target-display={args.target_display}: window-title capture is disabled")
+
     with mss.mss() as sct:
         log_monitors(sct)
         if args.calibrate:
-            run_calibration(sct, config_path, config, args.monitor_index, args.mss_monitor_index, use_gpu)
+            run_calibration(
+                sct,
+                config_path,
+                config,
+                args.target_display,
+                windows_monitors,
+                args.display_index,
+                args.mss_monitor_index,
+                use_gpu,
+            )
             return
 
         reader = easyocr.Reader(["en"], gpu=use_gpu)
 
-        monitor_base = choose_capture_region(sct, config, args.monitor_index, args.mss_monitor_index)
+        monitor_base = choose_capture_region(
+            sct,
+            args.target_display,
+            windows_monitors,
+            args.display_index,
+            args.mss_monitor_index,
+        )
         capture_rect = get_monitor_rect(config, monitor_base)
         print(
             "[INFO] final capture rect "
