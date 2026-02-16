@@ -794,6 +794,44 @@ def draw_ocr_bbox_overlay(roi_crop_final: np.ndarray, ocr_results: list[tuple[np
     return overlay
 
 
+def get_preprocess_geometry(vital_name: str, config: dict[str, Any], roi_crop_raw: np.ndarray) -> tuple[float, int]:
+    """Return (resize_scale, trim_px_after_resize) used by preprocess_roi for coordinate mapping."""
+    pp = config.get("preprocess", {}) if isinstance(config.get("preprocess"), dict) else {}
+    resize = float(pp.get("resize", 2.5))
+    if vital_name in TEMPERATURE_VITALS:
+        resize = max(resize, 3.0)
+    scale = resize if resize > 1.0 else 1.0
+
+    resized_h = int(round(roi_crop_raw.shape[0] * scale))
+    resized_w = int(round(roi_crop_raw.shape[1] * scale))
+
+    trim_px = int(pp.get("trim_px", 3))
+    if vital_name in TEMPERATURE_VITALS:
+        trim_px = max(trim_px, 2)
+    max_trim = max(min(resized_h, resized_w) // 4, 0)
+    trim_px = clamp(trim_px, 0, max_trim)
+    return scale, trim_px
+
+
+def map_bbox_to_raw_roi(
+    bbox_local_final: np.ndarray,
+    scale: float,
+    trim_px: int,
+    raw_shape: tuple[int, int],
+) -> np.ndarray:
+    """Map bbox from roi_crop_final coordinates back into roi_crop_raw coordinates."""
+    if bbox_local_final.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    raw_h, raw_w = raw_shape
+    bbox = bbox_local_final.astype(np.float32)
+    bbox[:, 0] = (bbox[:, 0] + float(trim_px)) / max(scale, 1e-6)
+    bbox[:, 1] = (bbox[:, 1] + float(trim_px)) / max(scale, 1e-6)
+    bbox[:, 0] = np.clip(bbox[:, 0], 0, max(raw_w - 1, 0))
+    bbox[:, 1] = np.clip(bbox[:, 1], 0, max(raw_h - 1, 0))
+    return np.rint(bbox).astype(np.int32)
+
+
 def crop_red_roi(frame: np.ndarray, roi_box: tuple[int, int, int, int], bed: str, vital: str) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
     frame_h, frame_w = frame.shape[:2]
     x1, y1, x2, y2 = (int(roi_box[0]), int(roi_box[1]), int(roi_box[2]), int(roi_box[3]))
@@ -1398,6 +1436,7 @@ def main() -> None:
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
+    parser.add_argument("--debug-full-overlay", type=parse_bool, default=False)
     parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
     parser.add_argument("--gpu", type=parse_bool, default=True)
@@ -1543,9 +1582,12 @@ def main() -> None:
                         write_debug_window_rect_image(debug_dir / f"{stamp}_window_rect.png", frame)
 
                     debug_img: np.ndarray | None = None
+                    full_overlay_img: np.ndarray | None = None
                     if args.debug_roi or args.debug_lines:
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         debug_img = frame.copy()
+                        if args.debug_full_overlay:
+                            full_overlay_img = frame.copy()
                         for bed in BED_IDS:
                             meta = roi_debug.get(bed, {})
                             bx1 = int(meta.get("bed_x1", 0))
@@ -1627,26 +1669,35 @@ def main() -> None:
                             beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
 
                             if args.debug_roi:
-                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_crop_raw.png"), roi_crop_raw)
-                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_crop_final.png"), roi_crop_final)
+                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_raw.png"), roi_crop_raw)
+                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_final.png"), roi_crop_final)
                                 roi_overlay = draw_ocr_bbox_overlay(roi_crop_final, ocr_results)
-                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_crop_final_bbox.png"), roi_overlay)
+                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_overlay.png"), roi_overlay)
                                 print(
                                     f"[INFO] debug sample bed={bed} vital={vital} roi_final_digits='{text}' OCR text='{text}'",
                                 )
 
-                                if debug_img is not None and best_bbox_local:
+                                if args.debug_full_overlay and full_overlay_img is not None and best_bbox_local:
                                     x1, y1, _x2, _y2 = roi_coords
+                                    scale, trim_px = get_preprocess_geometry(vital, config, roi_crop_raw)
                                     for bbox in best_bbox_local:
                                         if bbox.size == 0:
                                             continue
-                                        bbox_global = bbox.copy()
+                                        bbox_raw_local = map_bbox_to_raw_roi(
+                                            bbox_local_final=bbox,
+                                            scale=scale,
+                                            trim_px=trim_px,
+                                            raw_shape=roi_crop_raw.shape[:2],
+                                        )
+                                        bbox_global = bbox_raw_local.copy()
                                         bbox_global[:, 0] += x1
                                         bbox_global[:, 1] += y1
-                                        cv2.polylines(debug_img, [bbox_global.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
+                                        cv2.polylines(full_overlay_img, [bbox_global.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
 
                     if debug_img is not None:
                         cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
+                    if args.debug_roi and full_overlay_img is not None:
+                        cv2.imwrite(str(debug_dir / f"{stamp}_full_overlay.png"), full_overlay_img)
 
                     cache_snapshot = copy_cache_snapshot(cache_path, day_dir, stamp)
                     if not cache_snapshot:
