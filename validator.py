@@ -8,7 +8,7 @@ import json
 import math
 import re
 import statistics
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +57,9 @@ def parse_numeric_with_reason(raw_text: Any, raw_value: Any) -> tuple[float | No
     return None, f"invalid_numeric:{text}"
 
 
+JST = timezone(timedelta(hours=9))
+
+
 def parse_iso8601(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -65,16 +68,15 @@ def parse_iso8601(value: Any) -> datetime | None:
         return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    if " " in text and "T" not in text:
+        text = text.replace(" ", "T", 1)
     try:
         dt = datetime.fromisoformat(text)
     except ValueError:
         return None
     if dt.tzinfo is None:
-        return None
+        dt = dt.replace(tzinfo=JST)
     return dt
-
-
-JST = timezone(timedelta(hours=9))
 SNAPSHOT_FILENAME_PATTERN = re.compile(r"(\d{8})_(\d{6})_(\d{3})_monitor_cache\.json$")
 
 
@@ -248,6 +250,7 @@ def validate_records(
     snapshot_missing = 0
     snapshot_load_error = 0
     dt_skipped = 0
+    dt_skip_reason_counts: Counter[str] = Counter()
 
     def evaluate_record(
         rec: dict[str, Any],
@@ -255,15 +258,22 @@ def validate_records(
         truth_payload: dict[str, Any],
         ocr_dt_corrected: datetime | None,
         include_mismatch: bool,
-    ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]], float | None]:
+    ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]], float | None, str | None]:
         beds_payload = rec.get("beds", {})
         if not isinstance(beds_payload, dict):
             beds_payload = {}
 
         truth_dt = extract_message_datetime(truth_payload)
         dt_sec: float | None = None
+        dt_skip_reason: str | None = None
         if ocr_dt_corrected is not None and truth_dt is not None:
             dt_sec = (ocr_dt_corrected - truth_dt).total_seconds()
+        elif ocr_dt_corrected is None and truth_dt is None:
+            dt_skip_reason = "ocr_dt_none+truth_dt_none"
+        elif ocr_dt_corrected is None:
+            dt_skip_reason = "ocr_dt_none"
+        else:
+            dt_skip_reason = "truth_dt_none"
 
         per_item: list[dict[str, Any]] = []
         record_abs_errors: list[float] = []
@@ -343,7 +353,7 @@ def validate_records(
             "matched": float(record_matched),
             "mean_abs_error": mean_abs,
         }
-        return per_item, score, record_mismatches, dt_sec
+        return per_item, score, record_mismatches, dt_sec, dt_skip_reason
 
     for rec in ocr_records:
         ocr_dt = parse_iso8601(rec.get("timestamp"))
@@ -384,7 +394,7 @@ def validate_records(
                     continue
 
                 truth_map = extract_truth_map(truth_payload)
-                per_item, score, _, _ = evaluate_record(
+                per_item, score, _, _, _ = evaluate_record(
                     rec=rec,
                     truth_map=truth_map,
                     truth_payload=truth_payload,
@@ -419,7 +429,9 @@ def validate_records(
                 snapshot_used += 1
 
         if not cache_candidates or selected_snapshot_path is None:
-            snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path"), ocr_results_path)
+            snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path_before"), ocr_results_path)
+            if snapshot_path is None:
+                snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path"), ocr_results_path)
             if snapshot_path is None:
                 snapshot_missing += 1
                 fallback_used += 1
@@ -441,7 +453,7 @@ def validate_records(
                     selected_snapshot_path = None
                     selected_source = "monitor_cache_fallback"
 
-        per_item, score, record_mismatches, dt_sec = evaluate_record(
+        per_item, score, record_mismatches, dt_sec, dt_skip_reason = evaluate_record(
             rec=rec,
             truth_map=selected_map,
             truth_payload=selected_payload,
@@ -463,6 +475,7 @@ def validate_records(
             dt_seconds.append(abs(dt_sec))
         else:
             dt_skipped += 1
+            dt_skip_reason_counts[dt_skip_reason or "unknown"] += 1
 
         mismatches.extend(record_mismatches)
         details.append(
@@ -493,6 +506,7 @@ def validate_records(
         "dt_p90_seconds": percentile(dt_seconds, 0.9) if dt_seconds else 0.0,
         "dt_evaluated": float(len(dt_seconds)),
         "dt_skipped": float(dt_skipped),
+        "dt_skip_reason_counts": dict(dt_skip_reason_counts),
     }
 
     if dump_mismatch > 0:
@@ -632,6 +646,7 @@ def main() -> None:
         f"evaluated={int(metrics['dt_evaluated'])} "
         f"skipped={int(metrics['dt_skipped'])}"
     )
+    print(f"[INFO] dt_skip_reason_counts={metrics.get('dt_skip_reason_counts', {})}")
 
     if args.dump_mismatch > 0:
         print(f"[INFO] dump_mismatch_top={len(mismatches)}")

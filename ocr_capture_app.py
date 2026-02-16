@@ -1747,6 +1747,10 @@ def main() -> None:
                         image_path = images_dir / f"{stamp}.png"
                         cv2.imwrite(str(image_path), frame)
 
+                    cache_snapshot_before = copy_cache_snapshot(cache_path, day_dir, f"{stamp}_before")
+                    if not cache_snapshot_before:
+                        print(f"[WARN] pre-capture cache snapshot failed at {stamp}", file=sys.stderr)
+
                     if args.debug_window_rect:
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         write_debug_window_rect_image(debug_dir / f"{stamp}_window_rect.png", frame)
@@ -1883,6 +1887,7 @@ def main() -> None:
                     record = {
                         "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                         "image_path": image_path.as_posix() if image_path else None,
+                        "cache_snapshot_path_before": cache_snapshot_before,
                         "cache_snapshot_path": cache_snapshot,
                         "beds": beds,
                     }
