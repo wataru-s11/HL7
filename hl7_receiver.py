@@ -9,6 +9,7 @@ import queue
 import socket
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -16,6 +17,15 @@ from hl7_parser import HL7Message, HL7Parser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+JST = timezone(timedelta(hours=9))
+
+
+def to_jst_iso8601(dt_obj):
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=JST)
+    else:
+        dt_obj = dt_obj.astimezone(JST)
+    return dt_obj.isoformat(timespec="seconds")
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -73,14 +83,14 @@ class BedDataAggregator:
 
         with self._lock:
             self._beds[bed_id] = {
-                "message_datetime": msg.message_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+                "message_datetime": to_jst_iso8601(msg.message_datetime),
                 "patient_id": msg.patient_id,
                 "patient_name": msg.patient_name,
                 "bed_id": bed_id,
                 "vitals": vitals,
             }
             payload = {
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": to_jst_iso8601(datetime.now(JST)),
                 "beds": self._beds,
             }
             atomic_write_json(self.cache_path, payload)
