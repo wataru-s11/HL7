@@ -755,23 +755,58 @@ def parse_numeric(text: str, vital_name: str, config: dict[str, Any]) -> float |
     return None
 
 
-def run_ocr(reader: easyocr.Reader, roi_image: np.ndarray, vital_name: str, config: dict[str, Any]) -> tuple[str, float, list[tuple[str, np.ndarray]]]:
-    variants = ["normal", "invert", "otsu"] if vital_name in TEMPERATURE_VITALS else ["normal", "otsu"]
+def run_ocr(
+    reader: easyocr.Reader,
+    roi_image: np.ndarray,
+    vital_name: str,
+    config: dict[str, Any],
+) -> tuple[str, float, list[tuple[str, np.ndarray]], list[np.ndarray]]:
     best_text, best_conf = "", -1.0
-    debug_images: list[tuple[str, np.ndarray]] = []
+    best_bbox_local: list[np.ndarray] = []
 
+    # OCR must run against red ROI crop only (capture-image coordinate conversion is done before this call).
+    results = reader.readtext(roi_image, detail=1, paragraph=False, allowlist=ALLOWLIST)
+    for bbox, text, conf in results:
+        filtered = _sanitize_numeric_text(text)
+        if not filtered:
+            continue
+        try:
+            bbox_array = np.asarray(bbox, dtype=np.int32)
+        except Exception:
+            bbox_array = np.zeros((0, 2), dtype=np.int32)
+        if conf > best_conf:
+            best_text, best_conf = filtered, float(conf)
+            best_bbox_local = [bbox_array]
+
+    debug_images: list[tuple[str, np.ndarray]] = [("red", roi_image.copy())]
+    variants = ["normal", "invert", "otsu"] if vital_name in TEMPERATURE_VITALS else ["normal", "otsu"]
     for variant in variants:
-        processed = preprocess_roi(roi_image, vital_name, config, variant=variant)
-        debug_images.append((variant, processed))
-        results = reader.readtext(processed, detail=1, paragraph=False, allowlist=ALLOWLIST)
-        for _, text, conf in results:
-            filtered = _sanitize_numeric_text(text)
-            if filtered and conf > best_conf:
-                best_text, best_conf = filtered, float(conf)
+        debug_images.append((variant, preprocess_roi(roi_image, vital_name, config, variant=variant)))
 
     if best_conf < 0:
-        return "", 0.0, debug_images
-    return best_text, best_conf, debug_images
+        return "", 0.0, debug_images, []
+    return best_text, best_conf, debug_images, best_bbox_local
+
+
+def crop_red_roi(frame: np.ndarray, roi_box: tuple[int, int, int, int], bed: str, vital: str) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
+    frame_h, frame_w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(roi_box[0]), int(roi_box[1]), int(roi_box[2]), int(roi_box[3]))
+
+    if x1 >= x2 or y1 >= y2:
+        print(f"[WARN] invalid red ROI shape, skip {bed}.{vital}: ({x1}, {y1}, {x2}, {y2})", file=sys.stderr)
+        return None, None
+    if x1 < 0 or y1 < 0 or x2 > frame_w or y2 > frame_h:
+        print(
+            f"[WARN] red ROI out of capture-image bounds, skip {bed}.{vital}: ({x1}, {y1}, {x2}, {y2}) frame=({frame_w}x{frame_h})",
+            file=sys.stderr,
+        )
+        return None, None
+
+    roi_crop = frame[y1:y2, x1:x2].copy()
+    if roi_crop.size == 0:
+        print(f"[WARN] empty red ROI crop, skip {bed}.{vital}: ({x1}, {y1}, {x2}, {y2})", file=sys.stderr)
+        return None, None
+    return roi_crop, (x1, y1, x2, y2)
 
 
 def _offset_from_adjust(adjust: dict[str, Any], key: str, cell_w: int, cell_h: int) -> int:
@@ -1429,6 +1464,7 @@ def main() -> None:
                     day_dir = Path(args.outdir) / day
                     images_dir = day_dir / "images"
                     debug_dir = day_dir / "debug"
+                    roi_crops_dir = day_dir / "roi_crops"
                     day_dir.mkdir(parents=True, exist_ok=True)
                     if args.save_images:
                         images_dir.mkdir(parents=True, exist_ok=True)
@@ -1498,6 +1534,7 @@ def main() -> None:
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         write_debug_window_rect_image(debug_dir / f"{stamp}_window_rect.png", frame)
 
+                    debug_img: np.ndarray | None = None
                     if args.debug_roi or args.debug_lines:
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         debug_img = frame.copy()
@@ -1552,7 +1589,8 @@ def main() -> None:
                                     if red:
                                         x1, y1, x2, y2 = red
                                         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
-                        cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
+                        if args.debug_roi:
+                            roi_crops_dir.mkdir(parents=True, exist_ok=True)
 
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for bed in BED_IDS:
@@ -1561,16 +1599,35 @@ def main() -> None:
                             if roi_box is None:
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
                                 continue
-                            x1, y1, x2, y2 = roi_box
-                            roi = frame[y1:y2, x1:x2]
-                            text, conf, debug_variants = run_ocr(reader, roi, vital, config)
+
+                            roi_crop, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
+                            if roi_crop is None or roi_coords is None:
+                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
+                                continue
+
+                            x1, y1, x2, y2 = roi_coords
+                            text, conf, debug_variants, best_bbox_local = run_ocr(reader, roi_crop, vital, config)
                             value = parse_numeric(text, vital, config)
                             beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
 
                             if args.debug_roi:
+                                cv2.imwrite(str(roi_crops_dir / f"{bed}_{vital}_red.png"), roi_crop)
+
+                                if debug_img is not None and best_bbox_local:
+                                    for bbox in best_bbox_local:
+                                        if bbox.size == 0:
+                                            continue
+                                        bbox_global = bbox.copy()
+                                        bbox_global[:, 0] += x1
+                                        bbox_global[:, 1] += y1
+                                        cv2.polylines(debug_img, [bbox_global.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
+
                                 for variant_name, variant_img in debug_variants:
                                     roi_debug_path = debug_dir / f"{stamp}_roi_{bed}_{vital}_{variant_name}.png"
                                     cv2.imwrite(str(roi_debug_path), variant_img)
+
+                    if debug_img is not None:
+                        cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
 
                     cache_snapshot = copy_cache_snapshot(cache_path, day_dir, stamp)
                     if not cache_snapshot:
