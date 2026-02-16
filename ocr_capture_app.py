@@ -74,6 +74,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "header_crop_px": 60,
     "bed_grid": {"cols": 2, "rows": 3},
     "cell_grid": {"cols": 4, "rows": 5},
+    "roi_strategy": "cell_inner_slice",
     "value_roi": {
         "left_ratio": 0.45,
         "right_pad": 0.06,
