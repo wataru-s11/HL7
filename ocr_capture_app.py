@@ -92,7 +92,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pad_px": 4,
     },
     "cell_value_slice": {
-        "x1_ratio": 0.50,
+        "x1_ratio": 0.60,
         "x2_ratio": 0.98,
         "y1_ratio": 0.12,
         "y2_ratio": 0.90,
@@ -626,6 +626,208 @@ def detect_bed_grid_top(bed_img: np.ndarray, fallback_ratio: float = 0.22) -> tu
     return grid_top, detected_y, best_ratio
 
 
+def _cluster_line_positions(indices: np.ndarray, projection: np.ndarray) -> list[int]:
+    if indices.size == 0:
+        return []
+
+    lines: list[int] = []
+    group_start = int(indices[0])
+    prev = int(indices[0])
+
+    for raw_idx in indices[1:]:
+        idx = int(raw_idx)
+        if idx == prev + 1:
+            prev = idx
+            continue
+
+        segment = np.arange(group_start, prev + 1)
+        weights = projection[group_start : prev + 1] + 1e-6
+        center = int(round(np.average(segment, weights=weights)))
+        lines.append(center)
+        group_start = idx
+        prev = idx
+
+    segment = np.arange(group_start, prev + 1)
+    weights = projection[group_start : prev + 1] + 1e-6
+    center = int(round(np.average(segment, weights=weights)))
+    lines.append(center)
+    return lines
+
+
+def _fit_expected_lines(lines: list[int], expected_count: int, start: int, end: int) -> list[int] | None:
+    if len(lines) < expected_count:
+        return None
+    if expected_count <= 1:
+        return [clamp(lines[0], start, end)]
+
+    sorted_lines = sorted(clamp(v, start, end) for v in lines)
+    if len(sorted_lines) == expected_count:
+        return sorted_lines
+
+    targets = np.linspace(start, end, expected_count)
+    selected: list[int] = []
+    cursor = 0
+    for target in targets:
+        best_idx: int | None = None
+        best_dist = None
+        for idx in range(cursor, len(sorted_lines)):
+            dist = abs(sorted_lines[idx] - target)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+            elif sorted_lines[idx] > target and best_dist is not None:
+                break
+        if best_idx is None:
+            return None
+        cursor = best_idx + 1
+        selected.append(sorted_lines[best_idx])
+
+    if len(selected) != expected_count:
+        return None
+
+    # enforce strictly increasing order by 1px minimum separation
+    for idx in range(1, len(selected)):
+        if selected[idx] <= selected[idx - 1]:
+            selected[idx] = min(end, selected[idx - 1] + 1)
+    if selected[-1] > end:
+        return None
+    return selected
+
+
+def detect_grid_lines(img: np.ndarray) -> dict[str, Any]:
+    """Detect thick horizontal/vertical grid lines from black table borders."""
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, otsu_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    adaptive_inv = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7,
+    )
+    line_src = cv2.bitwise_or(otsu_inv, adaptive_inv)
+
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w // 20), 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, h // 20)))
+    horizontal = cv2.morphologyEx(line_src, cv2.MORPH_OPEN, horizontal_kernel)
+    vertical = cv2.morphologyEx(line_src, cv2.MORPH_OPEN, vertical_kernel)
+
+    x_projection = vertical.sum(axis=0) / 255.0
+    y_projection = horizontal.sum(axis=1) / 255.0
+    x_threshold = max(float(h) * 0.18, float(x_projection.max()) * 0.35 if x_projection.size else 0.0)
+    y_threshold = max(float(w) * 0.18, float(y_projection.max()) * 0.35 if y_projection.size else 0.0)
+
+    x_indices = np.where(x_projection >= x_threshold)[0]
+    y_indices = np.where(y_projection >= y_threshold)[0]
+
+    x_lines = _cluster_line_positions(x_indices, x_projection)
+    y_lines = _cluster_line_positions(y_indices, y_projection)
+    return {
+        "x_lines": sorted(x_lines),
+        "y_lines": sorted(y_lines),
+        "horizontal_mask": horizontal,
+        "vertical_mask": vertical,
+        "x_threshold": float(x_threshold),
+        "y_threshold": float(y_threshold),
+    }
+
+
+def detect_bed_panels(
+    frame: np.ndarray,
+    header_crop_px: int,
+    bed_cols: int,
+    bed_rows: int,
+) -> tuple[dict[str, tuple[int, int, int, int]], dict[str, Any], bool]:
+    frame_h, frame_w = frame.shape[:2]
+    body_top = clamp(header_crop_px, 0, frame_h - 1)
+    body_img = frame[body_top:frame_h, :]
+    body_h = max(frame_h - body_top, 1)
+
+    detected = detect_grid_lines(body_img)
+    fit_x = _fit_expected_lines(detected["x_lines"], bed_cols + 1, 0, max(frame_w - 1, 0))
+    fit_y = _fit_expected_lines(detected["y_lines"], bed_rows + 1, 0, max(body_h - 1, 0))
+
+    panels: dict[str, tuple[int, int, int, int]] = {}
+    used_detected = fit_x is not None and fit_y is not None
+    if used_detected:
+        assert fit_x is not None
+        assert fit_y is not None
+        for bed_idx, bed in enumerate(BED_IDS):
+            bed_row = bed_idx // bed_cols
+            bed_col = bed_idx % bed_cols
+            bx1 = fit_x[bed_col]
+            bx2 = fit_x[bed_col + 1]
+            by1 = body_top + fit_y[bed_row]
+            by2 = body_top + fit_y[bed_row + 1]
+            panels[bed] = (bx1, by1, max(bx1 + 1, bx2), max(by1 + 1, by2))
+    else:
+        for bed_idx, bed in enumerate(BED_IDS):
+            bed_row = bed_idx // bed_cols
+            bed_col = bed_idx % bed_cols
+            bx1 = int((bed_col * frame_w) / bed_cols)
+            bx2 = int(((bed_col + 1) * frame_w) / bed_cols)
+            by1 = body_top + int((bed_row * body_h) / bed_rows)
+            by2 = body_top + int(((bed_row + 1) * body_h) / bed_rows)
+            panels[bed] = (bx1, by1, bx2, by2)
+
+    debug = {
+        "x_lines": detected["x_lines"],
+        "y_lines": [body_top + y for y in detected["y_lines"]],
+        "fit_x": fit_x,
+        "fit_y": [body_top + y for y in fit_y] if fit_y is not None else None,
+        "used_detected": used_detected,
+    }
+    return panels, debug, used_detected
+
+
+def detect_cells_in_bed(
+    frame: np.ndarray,
+    bed_rect: tuple[int, int, int, int],
+    cell_cols: int,
+    cell_rows: int,
+) -> tuple[list[tuple[int, int, int, int]] | None, dict[str, Any], bool]:
+    bx1, by1, bx2, by2 = bed_rect
+    bed_img = frame[by1:by2, bx1:bx2]
+    bed_h, bed_w = bed_img.shape[:2]
+    if bed_h < 2 or bed_w < 2:
+        return None, {"used_detected": False}, False
+
+    grid_top, detected_line_y, line_ratio = detect_bed_grid_top(bed_img)
+    grid_roi = bed_img[grid_top:bed_h, :]
+    detected = detect_grid_lines(grid_roi)
+    fit_x = _fit_expected_lines(detected["x_lines"], cell_cols + 1, 0, max(bed_w - 1, 0))
+    fit_y = _fit_expected_lines(detected["y_lines"], cell_rows + 1, 0, max(grid_roi.shape[0] - 1, 0))
+
+    used_detected = fit_x is not None and fit_y is not None
+    cells: list[tuple[int, int, int, int]] | None = None
+    if used_detected:
+        assert fit_x is not None
+        assert fit_y is not None
+        cells = []
+        for row in range(cell_rows):
+            for col in range(cell_cols):
+                x1 = bx1 + fit_x[col]
+                x2 = bx1 + fit_x[col + 1]
+                y1 = by1 + grid_top + fit_y[row]
+                y2 = by1 + grid_top + fit_y[row + 1]
+                cells.append((x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)))
+
+    debug = {
+        "grid_top": grid_top,
+        "header_bottom_line_y": (by1 + detected_line_y) if detected_line_y is not None else None,
+        "line_ratio": line_ratio,
+        "x_lines": [bx1 + x for x in detected["x_lines"]],
+        "y_lines": [by1 + grid_top + y for y in detected["y_lines"]],
+        "fit_x": [bx1 + x for x in fit_x] if fit_x is not None else None,
+        "fit_y": [by1 + grid_top + y for y in fit_y] if fit_y is not None else None,
+        "used_detected": used_detected,
+    }
+    return cells, debug, used_detected
+
+
 def build_vital_rois(
     frame: np.ndarray,
     config: dict[str, Any],
@@ -635,8 +837,6 @@ def build_vital_rois(
 ]:
     frame_h, frame_w = frame.shape[:2]
     header_crop_px = clamp(int(config.get("header_crop_px", 60)), 0, frame_h - 1)
-    body_top = header_crop_px
-    body_h = max(frame_h - body_top, 1)
 
     bed_grid = config.get("bed_grid", {})
     cell_grid = config.get("cell_grid", {})
@@ -654,7 +854,7 @@ def build_vital_rois(
     value_box_cfg = config.get("value_box") if isinstance(config.get("value_box"), dict) else None
 
     cell_pad_px = max(int(cell_inner_box_cfg.get("pad_px", 4)), 0)
-    value_x1_ratio = float(cell_value_slice_cfg.get("x1_ratio", 0.50))
+    value_x1_ratio = float(cell_value_slice_cfg.get("x1_ratio", 0.60))
     value_x2_ratio = float(cell_value_slice_cfg.get("x2_ratio", 0.98))
     value_y1_ratio = float(cell_value_slice_cfg.get("y1_ratio", 0.12))
     value_y2_ratio = float(cell_value_slice_cfg.get("y2_ratio", 0.90))
@@ -664,21 +864,28 @@ def build_vital_rois(
     out: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
     debug_meta: dict[str, dict[str, Any]] = {}
 
-    for bed_idx, bed in enumerate(BED_IDS):
-        bed_row = bed_idx // bed_cols
-        bed_col = bed_idx % bed_cols
+    bed_panels, panel_debug, panel_detected = detect_bed_panels(frame, header_crop_px, bed_cols, bed_rows)
+    print(
+        "[INFO] detect_bed_panels "
+        f"used_detected={panel_detected} "
+        f"x_lines={len(panel_debug.get('x_lines', []))} y_lines={len(panel_debug.get('y_lines', []))} "
+        f"fit_x={panel_debug.get('fit_x')} fit_y={panel_debug.get('fit_y')}"
+    )
 
-        bx1 = int((bed_col * frame_w) / bed_cols)
-        bx2 = int(((bed_col + 1) * frame_w) / bed_cols)
-        by1 = body_top + int((bed_row * body_h) / bed_rows)
-        by2 = body_top + int(((bed_row + 1) * body_h) / bed_rows)
+    for bed in BED_IDS:
+        bx1, by1, bx2, by2 = bed_panels[bed]
 
         bed_w = max(bx2 - bx1, 1)
         bed_h = max(by2 - by1, 1)
 
-        bed_img = frame[by1:by2, bx1:bx2]
-        grid_top, detected_line_y, line_ratio = detect_bed_grid_top(bed_img)
+        cells, bed_line_debug, bed_detected = detect_cells_in_bed(frame, (bx1, by1, bx2, by2), cell_cols, cell_rows)
+        print(
+            f"[INFO] {bed} line_detect used_detected={bed_detected} "
+            f"x_lines={len(bed_line_debug.get('x_lines', []))} y_lines={len(bed_line_debug.get('y_lines', []))} "
+            f"fit_x={bed_line_debug.get('fit_x')} fit_y={bed_line_debug.get('fit_y')}"
+        )
 
+        grid_top = int(bed_line_debug.get("grid_top", 0))
         grid_y1 = by1 + grid_top
         grid_y2 = by2
         grid_h = max(grid_y2 - grid_y1, 1)
@@ -691,10 +898,16 @@ def build_vital_rois(
             "grid_top": grid_top,
             "grid_y1": grid_y1,
             "grid_y2": grid_y2,
-            "header_bottom_line_y": (by1 + detected_line_y) if detected_line_y is not None else None,
-            "line_ratio": line_ratio,
-            "header_line_detected": detected_line_y is not None,
+            "header_bottom_line_y": bed_line_debug.get("header_bottom_line_y"),
+            "line_ratio": float(bed_line_debug.get("line_ratio", 0.0)),
+            "header_line_detected": bed_line_debug.get("header_bottom_line_y") is not None,
+            "used_detected_lines": bed_detected,
+            "detected_x_lines": bed_line_debug.get("x_lines", []),
+            "detected_y_lines": bed_line_debug.get("y_lines", []),
+            "fit_x_lines": bed_line_debug.get("fit_x", []),
+            "fit_y_lines": bed_line_debug.get("fit_y", []),
             "cell_inner_boxes": {},
+            "cell_boxes": {},
             "value_rois": {},
         }
 
@@ -702,10 +915,13 @@ def build_vital_rois(
             c_row = idx // cell_cols
             c_col = idx % cell_cols
 
-            cx1 = bx1 + int((c_col * bed_w) / cell_cols)
-            cx2 = bx1 + int(((c_col + 1) * bed_w) / cell_cols)
-            cy1 = grid_y1 + int((c_row * grid_h) / cell_rows)
-            cy2 = grid_y1 + int(((c_row + 1) * grid_h) / cell_rows)
+            if cells is not None:
+                cx1, cy1, cx2, cy2 = cells[idx]
+            else:
+                cx1 = bx1 + int((c_col * bed_w) / cell_cols)
+                cx2 = bx1 + int(((c_col + 1) * bed_w) / cell_cols)
+                cy1 = grid_y1 + int((c_row * grid_h) / cell_rows)
+                cy2 = grid_y1 + int(((c_row + 1) * grid_h) / cell_rows)
 
             cw, ch = max(cx2 - cx1, 1), max(cy2 - cy1, 1)
 
@@ -747,6 +963,7 @@ def build_vital_rois(
                 vy2 = clamp(vy2 + _offset_from_adjust(vital_adjust, "dy2", cw, ch), vy1 + 1, cy2)
 
             out[bed][vital] = (vx1, vy1, vx2, vy2)
+            debug_meta[bed]["cell_boxes"][vital] = (cx1, cy1, cx2, cy2)
             debug_meta[bed]["cell_inner_boxes"][vital] = (cell_x1, cell_y1, cell_x2, cell_y2)
             debug_meta[bed]["value_rois"][vital] = (vx1, vy1, vx2, vy2)
 
@@ -868,7 +1085,7 @@ def run_calibration(
     cell_inner = config.setdefault("cell_inner_box", dict(DEFAULT_CONFIG["cell_inner_box"]))
     cell_slice = config.setdefault("cell_value_slice", dict(DEFAULT_CONFIG["cell_value_slice"]))
     add_trackbar("cell_pad_px", int(cell_inner.get("pad_px", 4)), 40)
-    add_trackbar("value_x1_ratio(%)", int(float(cell_slice.get("x1_ratio", 0.50)) * 100), 99)
+    add_trackbar("value_x1_ratio(%)", int(float(cell_slice.get("x1_ratio", 0.60)) * 100), 99)
     add_trackbar("value_x2_ratio(%)", int(float(cell_slice.get("x2_ratio", 0.98)) * 100), 100)
     add_trackbar("value_y1_ratio(%)", int(float(cell_slice.get("y1_ratio", 0.12)) * 100), 99)
     add_trackbar("value_y2_ratio(%)", int(float(cell_slice.get("y2_ratio", 0.90)) * 100), 100)
@@ -934,6 +1151,7 @@ def main() -> None:
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
+    parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
     parser.add_argument("--gpu", type=parse_bool, default=True)
     parser.add_argument("--no-launch-monitor", type=parse_bool, default=True)  # MOD: 安全側デフォルト
@@ -1049,7 +1267,7 @@ def main() -> None:
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         write_debug_window_rect_image(debug_dir / f"{stamp}_window_rect.png", frame)
 
-                    if args.debug_roi:
+                    if args.debug_roi or args.debug_lines:
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         debug_img = frame.copy()
                         for bed in BED_IDS:
@@ -1062,31 +1280,40 @@ def main() -> None:
                             gy2 = int(meta.get("grid_y2", by2))
                             header_line = meta.get("header_bottom_line_y")
 
-                            if header_line is not None:
-                                hy = int(header_line)
-                                cv2.line(debug_img, (bx1, hy), (bx2 - 1, hy), (0, 255, 0), 2)
+                            if args.debug_lines:
+                                for line_x in meta.get("detected_x_lines", []):
+                                    lx = int(line_x)
+                                    cv2.line(debug_img, (lx, by1), (lx, by2 - 1), (0, 180, 0), 1)
+                                for line_y in meta.get("detected_y_lines", []):
+                                    ly = int(line_y)
+                                    cv2.line(debug_img, (bx1, ly), (bx2 - 1, ly), (0, 180, 0), 1)
 
-                            cv2.rectangle(debug_img, (bx1, gy1), (bx2 - 1, gy2 - 1), (255, 0, 0), 2)
-                            cv2.putText(
-                                debug_img,
-                                f"{bed} grid_top={int(meta.get('grid_top', 0))}",
-                                (bx1 + 3, max(gy1 - 6, 12)),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.35,
-                                (255, 255, 0),
-                                1,
-                                cv2.LINE_AA,
-                            )
+                            if args.debug_roi:
+                                if header_line is not None:
+                                    hy = int(header_line)
+                                    cv2.line(debug_img, (bx1, hy), (bx2 - 1, hy), (0, 255, 0), 2)
 
-                            cell_inner_boxes = meta.get("cell_inner_boxes", {})
-                            for vital in VITAL_ORDER:
-                                inner = cell_inner_boxes.get(vital)
-                                if isinstance(inner, tuple) and len(inner) == 4:
-                                    ci_x1, ci_y1, ci_x2, ci_y2 = inner
-                                    cv2.rectangle(debug_img, (ci_x1, ci_y1), (ci_x2, ci_y2), (255, 0, 0), 1)
+                                cv2.rectangle(debug_img, (bx1, gy1), (bx2 - 1, gy2 - 1), (255, 0, 0), 2)
+                                cv2.putText(
+                                    debug_img,
+                                    f"{bed} grid_top={int(meta.get('grid_top', 0))}",
+                                    (bx1 + 3, max(gy1 - 6, 12)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.35,
+                                    (255, 255, 0),
+                                    1,
+                                    cv2.LINE_AA,
+                                )
 
-                                x1, y1, x2, y2 = rois[bed][vital]
-                                cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
+                                cell_boxes = meta.get("cell_boxes", {})
+                                for vital in VITAL_ORDER:
+                                    cell = cell_boxes.get(vital)
+                                    if isinstance(cell, tuple) and len(cell) == 4:
+                                        cx1, cy1, cx2, cy2 = cell
+                                        cv2.rectangle(debug_img, (cx1, cy1), (cx2, cy2), (255, 0, 0), 1)
+
+                                    x1, y1, x2, y2 = rois[bed][vital]
+                                    cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
                         cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
 
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
