@@ -74,6 +74,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "top_pad": 0.10,
         "bottom_pad": 0.12,
     },
+    "value_box": {
+        "x1_ratio": 0.58,
+        "x2_ratio": 0.98,
+        "y1_ratio": 0.20,
+        "y2_ratio": 0.85,
+        "pad_px": 2,
+    },
     # MOD: vital別ROI微調整設定を追加（px/ratioの両対応）
     "per_vital_roi_adjust": {},
     "preprocess": {"grayscale": True, "resize": 2.0, "threshold": False, "threshold_value": 160},
@@ -119,6 +126,9 @@ def ensure_config(path: Path) -> dict[str, Any]:
     if "resize" not in pp_cfg and "scale" in pp_cfg:
         pp_cfg["resize"] = pp_cfg.get("scale")
     config["value_roi"] = roi_cfg
+    vb_cfg = dict(DEFAULT_CONFIG.get("value_box", {}))
+    vb_cfg.update(config.get("value_box", {}) if isinstance(config.get("value_box"), dict) else {})
+    config["value_box"] = vb_cfg
     config["preprocess"] = pp_cfg
     config.setdefault("per_vital_roi_adjust", {})
     return config
@@ -280,10 +290,19 @@ def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> di
     cell_cols, cell_rows = int(cell_grid.get("cols", 4)), int(cell_grid.get("rows", 5))
 
     roi_cfg = config.get("value_roi", {})
+    value_box_cfg = config.get("value_box") if isinstance(config.get("value_box"), dict) else None
     left_ratio = float(roi_cfg.get("left_ratio", 0.45))
     right_pad = float(roi_cfg.get("right_pad", 0.06))
     top_pad = float(roi_cfg.get("top_pad", 0.10))
     bottom_pad = float(roi_cfg.get("bottom_pad", 0.12))
+
+    if value_box_cfg is not None:
+        value_x1_ratio = float(value_box_cfg.get("x1_ratio", 0.58))
+        value_x2_ratio = float(value_box_cfg.get("x2_ratio", 0.98))
+        value_y1_ratio = float(value_box_cfg.get("y1_ratio", 0.20))
+        value_y2_ratio = float(value_box_cfg.get("y2_ratio", 0.85))
+        value_pad_px = max(int(value_box_cfg.get("pad_px", 2)), 0)
+
     adjust_cfg = config.get("per_vital_roi_adjust", {})
 
     out: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
@@ -310,10 +329,27 @@ def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> di
             cy2 = by1 + int(((c_row + 1) * bed_h) / cell_rows)
 
             cw, ch = max(cx2 - cx1, 1), max(cy2 - cy1, 1)
-            vx1 = clamp(cx1 + int(cw * left_ratio), cx1, cx2 - 1)
-            vx2 = clamp(cx2 - int(cw * right_pad), vx1 + 1, cx2)
-            vy1 = clamp(cy1 + int(ch * top_pad), cy1, cy2 - 1)
-            vy2 = clamp(cy2 - int(ch * bottom_pad), vy1 + 1, cy2)
+
+            if value_box_cfg is not None:
+                vx1 = cx1 + int(cw * value_x1_ratio)
+                vx2 = cx1 + int(cw * value_x2_ratio)
+                vy1 = cy1 + int(ch * value_y1_ratio)
+                vy2 = cy1 + int(ch * value_y2_ratio)
+
+                vx1 += value_pad_px
+                vy1 += value_pad_px
+                vx2 -= value_pad_px
+                vy2 -= value_pad_px
+
+                vx1 = clamp(vx1, cx1, cx2 - 1)
+                vy1 = clamp(vy1, cy1, cy2 - 1)
+                vx2 = clamp(vx2, vx1 + 1, cx2)
+                vy2 = clamp(vy2, vy1 + 1, cy2)
+            else:
+                vx1 = clamp(cx1 + int(cw * left_ratio), cx1, cx2 - 1)
+                vx2 = clamp(cx2 - int(cw * right_pad), vx1 + 1, cx2)
+                vy1 = clamp(cy1 + int(ch * top_pad), cy1, cy2 - 1)
+                vy2 = clamp(cy2 - int(ch * bottom_pad), vy1 + 1, cy2)
 
             # MOD: vital毎のROI補正を適用
             vital_adjust = adjust_cfg.get(vital) if isinstance(adjust_cfg, dict) else None
@@ -406,17 +442,24 @@ def run_calibration(
         cv2.createTrackbar(name, win, value, max_value, lambda _v: None)
 
     add_trackbar("header_crop_px", int(config.get("header_crop_px", 60)), max(1, h - 1))
-    add_trackbar("value_left_ratio(%)", int(float(config["value_roi"].get("left_ratio", 0.45)) * 100), 90)
-    add_trackbar("right_pad(%)", int(float(config["value_roi"].get("right_pad", 0.06)) * 100), 50)
-    add_trackbar("top_pad(%)", int(float(config["value_roi"].get("top_pad", 0.10)) * 100), 50)
-    add_trackbar("bottom_pad(%)", int(float(config["value_roi"].get("bottom_pad", 0.12)) * 100), 50)
+    value_box = config.setdefault("value_box", dict(DEFAULT_CONFIG["value_box"]))
+    add_trackbar("value_x1(%)", int(float(value_box.get("x1_ratio", 0.58)) * 100), 99)
+    add_trackbar("value_x2(%)", int(float(value_box.get("x2_ratio", 0.98)) * 100), 100)
+    add_trackbar("value_y1(%)", int(float(value_box.get("y1_ratio", 0.20)) * 100), 99)
+    add_trackbar("value_y2(%)", int(float(value_box.get("y2_ratio", 0.85)) * 100), 100)
+    add_trackbar("pad_px", int(value_box.get("pad_px", 2)), 20)
 
     while True:
         config["header_crop_px"] = cv2.getTrackbarPos("header_crop_px", win)
-        config["value_roi"]["left_ratio"] = cv2.getTrackbarPos("value_left_ratio(%)", win) / 100.0
-        config["value_roi"]["right_pad"] = cv2.getTrackbarPos("right_pad(%)", win) / 100.0
-        config["value_roi"]["top_pad"] = cv2.getTrackbarPos("top_pad(%)", win) / 100.0
-        config["value_roi"]["bottom_pad"] = cv2.getTrackbarPos("bottom_pad(%)", win) / 100.0
+        value_x1 = cv2.getTrackbarPos("value_x1(%)", win)
+        value_x2 = cv2.getTrackbarPos("value_x2(%)", win)
+        value_y1 = cv2.getTrackbarPos("value_y1(%)", win)
+        value_y2 = cv2.getTrackbarPos("value_y2(%)", win)
+        config["value_box"]["x1_ratio"] = min(value_x1, value_x2) / 100.0
+        config["value_box"]["x2_ratio"] = max(value_x1, value_x2) / 100.0
+        config["value_box"]["y1_ratio"] = min(value_y1, value_y2) / 100.0
+        config["value_box"]["y2_ratio"] = max(value_y1, value_y2) / 100.0
+        config["value_box"]["pad_px"] = cv2.getTrackbarPos("pad_px", win)
 
         rois = build_vital_rois((h, w), config)
         x1, y1, x2, y2 = rois["BED01"]["RAP_M"]
