@@ -122,7 +122,7 @@ python generator.py --host 127.0.0.1 --port 2575 --interval 10
 
 ## OCRキャプチャ学習データ作成アプリ
 
-`ocr_capture_app.py` は `monitor.py` をサブプロセスで起動し、表示中フレームを定期キャプチャして EasyOCR で数値を抽出し、JSON Linesへ追記保存します。
+`ocr_capture_app.py` は表示中の monitor 画面を定期キャプチャして EasyOCR で数値抽出し、JSON Lines へ追記保存します。
 
 ### 追加インストール
 
@@ -130,39 +130,38 @@ python generator.py --host 127.0.0.1 --port 2575 --interval 10
 python -m pip install -r requirements.txt
 ```
 
+### モニター選択の考え方（mss index）
+
+- 起動時に `mss.monitors` の一覧（`index / left / top / width / height`）を必ずログ表示します。
+- `--mss-monitor-index` を指定すると、その index のモニター全域をキャプチャします（`window_title` 検索は無視）。
+- Windows の「ディスプレイ番号」と `mss` index が一致しない場合があるため、上記ログを見て index を選んでください。
+- `--mss-monitor-index` 未指定時は従来互換（`window_title` を優先、見つからなければ `--monitor-index`）で動作します。
+
 ### 実行例
 
 ```powershell
-python ocr_capture_app.py --cache monitor_cache.json --outdir dataset --interval-ms 1000 --fullscreen true
+# monitor.py を起動せず、mss monitor index=3 を10秒間隔でOCR（GPU有効）
+python ocr_capture_app.py --cache monitor_cache.json --config ocr_capture_config.json --outdir dataset --interval-ms 10000 --no-launch-monitor true --mss-monitor-index 3 --gpu true
+
+# debug ROI画像を保存（bed/vitalラベル付き）
+python ocr_capture_app.py --cache monitor_cache.json --debug-roi true --save-images true
+
+# validator 単体実行（最新50件）
+python validator.py --ocr-results dataset/20260216/ocr_results.jsonl --monitor-cache monitor_cache.json --validator-config validator_config.json --last 50
 ```
 
 ### 主なオプション
 
+- `--no-launch-monitor true` : `monitor.py` を起動せず、既に表示されている画面だけをキャプチャ（デフォルト）
+- `--mss-monitor-index 3` : `sct.monitors[3]` を使ってモニター全域キャプチャ
 - `--save-images false` : 画像保存を無効化（`ocr_results.jsonl` のみ追記）
-- `--debug-roi true` : ROI枠付きデバッグ画像を `dataset/debug/` に保存
-- `--config ocr_capture_config.json` : ROI比率・前処理・fallback領域を設定
+- `--debug-roi true` : ROI枠 + `BEDxx:vital` ラベル付きデバッグ画像を保存
+- `--gpu true/false` : EasyOCR のGPU利用を指定（CUDA不可時は自動CPUフォールバック）
+- `--run-validator true` : キャプチャごとに `validator.py` を実行（重いので既定は false）
 
 ### 出力
 
-- `dataset/images/*.png` : フレーム画像
-- `dataset/ocr_results.jsonl` : 1フレーム=1JSON（append）
+- `dataset/<YYYYMMDD>/images/*.png` : フレーム画像
+- `dataset/<YYYYMMDD>/ocr_results.jsonl` : 1フレーム=1JSON（append）
+- `dataset/<YYYYMMDD>/validation_results.jsonl` : validator比較結果
 
-JSONレコード例:
-
-```json
-{
-  "timestamp": "2026-02-14T11:32:01.123+09:00",
-  "image_path": "dataset/images/20260214_113201_123.png",
-  "source": {"app": "monitor.py", "cache": "monitor_cache.json"},
-  "beds": {
-    "BED01": {
-      "HR": {"text": "160", "value": 160.0, "confidence": 0.92}
-    }
-  }
-}
-```
-
-### monitor.py 全画面起動
-
-- `monitor.py` に `--fullscreen true` を追加。
-- 全画面中は `Esc` で全画面解除し、そのまま終了できます。
