@@ -133,6 +133,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "adaptive_block_size": 31,
         "adaptive_c": 2,
         "morph_kernel": 2,
+        "ocr_variants": ["normal", "invert", "otsu"],
     },
     "vital_ranges": DEFAULT_VITAL_RANGES,
 }
@@ -502,6 +503,10 @@ def ensure_config(path: Path) -> dict[str, Any]:
         pp_cfg["threshold_value"] = int(pp_cfg.get("threshold_value", 170))
     except Exception:
         pp_cfg["threshold_value"] = 170
+    variants_cfg = pp_cfg.get("ocr_variants", ["normal", "invert", "otsu"])
+    if not isinstance(variants_cfg, list):
+        variants_cfg = ["normal", "invert", "otsu"]
+    pp_cfg["ocr_variants"] = [str(v).strip().lower() for v in variants_cfg if str(v).strip()]
     config["value_roi"] = roi_cfg
     vb_cfg = dict(DEFAULT_CONFIG.get("value_box", {}))
     vb_cfg.update(config.get("value_box", {}) if isinstance(config.get("value_box"), dict) else {})
@@ -745,17 +750,19 @@ def preprocess_roi(img: np.ndarray, vital_name: str, config: dict[str, Any], var
     threshold_mode = str(pp.get("threshold_mode", "adaptive")).lower()
     if variant == "otsu" or threshold_mode == "otsu":
         _, out = cv2.threshold(out, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    elif use_threshold:
-        threshold_value = int(pp.get("threshold_value", 170))
-        threshold_value = clamp(threshold_value, 0, 255)
-        _, out = cv2.threshold(out, threshold_value, 255, cv2.THRESH_BINARY)
-    else:
+    elif variant == "adaptive" or threshold_mode == "adaptive":
         block_size = int(pp.get("adaptive_block_size", 31))
         if block_size % 2 == 0:
             block_size += 1
         block_size = max(block_size, 3)
         c_value = int(pp.get("adaptive_c", 2))
         out = cv2.adaptiveThreshold(out, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block_size, c_value)
+    elif use_threshold:
+        threshold_value = int(pp.get("threshold_value", 170))
+        threshold_value = clamp(threshold_value, 0, 255)
+        _, out = cv2.threshold(out, threshold_value, 255, cv2.THRESH_BINARY)
+    else:
+        _, out = cv2.threshold(out, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     kernel_size = int(pp.get("morph_kernel", 2))
     if kernel_size > 0:
@@ -839,6 +846,63 @@ def ocr_one_roi(reader: easyocr.Reader, roi_crop_final: np.ndarray) -> tuple[str
     if best_conf < 0:
         return "", 0.0, [], []
     return best_text, best_conf, best_bbox_local, results
+
+
+def _get_ocr_variants(config: dict[str, Any]) -> list[str]:
+    pp = config.get("preprocess", {}) if isinstance(config.get("preprocess"), dict) else {}
+    variants_cfg = pp.get("ocr_variants", ["normal", "invert", "otsu"])
+    if not isinstance(variants_cfg, list):
+        return ["normal", "invert", "otsu"]
+    variants: list[str] = []
+    for item in variants_cfg:
+        name = str(item).strip().lower()
+        if not name:
+            continue
+        if name not in variants:
+            variants.append(name)
+    return variants or ["normal"]
+
+
+def ocr_with_fallback_variants(
+    reader: easyocr.Reader,
+    roi_crop_raw: np.ndarray,
+    vital_name: str,
+    config: dict[str, Any],
+) -> tuple[str, float | None, float, list[np.ndarray], str]:
+    best_any_text, best_any_conf = "", -1.0
+    best_any_bbox: list[np.ndarray] = []
+    best_any_variant = "normal"
+
+    best_valid_text, best_valid_conf = "", -1.0
+    best_valid_value: float | None = None
+    best_valid_bbox: list[np.ndarray] = []
+    best_valid_variant = "normal"
+
+    for variant in _get_ocr_variants(config):
+        roi_crop_final = preprocess_roi(roi_crop_raw, vital_name, config, variant=variant)
+        if roi_crop_final.size == 0:
+            continue
+
+        text, conf, bbox_local, _ocr_results = ocr_one_roi(reader, roi_crop_final)
+        value = parse_numeric(text, vital_name, config)
+
+        if conf > best_any_conf:
+            best_any_text, best_any_conf = text, conf
+            best_any_bbox = bbox_local
+            best_any_variant = variant
+
+        if value is not None and conf > best_valid_conf:
+            best_valid_text, best_valid_conf = text, conf
+            best_valid_value = value
+            best_valid_bbox = bbox_local
+            best_valid_variant = variant
+
+    if best_valid_value is not None:
+        return best_valid_text, best_valid_value, best_valid_conf, best_valid_bbox, best_valid_variant
+
+    if best_any_conf < 0:
+        return "", None, 0.0, [], "normal"
+    return best_any_text, None, best_any_conf, best_any_bbox, best_any_variant
 
 
 def draw_ocr_bbox_overlay(roi_crop_final: np.ndarray, ocr_results: list[tuple[np.ndarray, str, float]]) -> np.ndarray:
@@ -1765,26 +1829,30 @@ def main() -> None:
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
                                 continue
 
-                            roi_crop_final = preprocess_roi(roi_crop_raw, vital, config, variant="normal")
-                            if roi_crop_final.size == 0:
+                            roi_crop_debug = preprocess_roi(roi_crop_raw, vital, config, variant="normal")
+                            if roi_crop_debug.size == 0:
                                 print(f"[WARN] empty final ROI after preprocess, skip {bed}.{vital}", file=sys.stderr)
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
                                 continue
 
                             if args.debug_roi:
-                                print(f"[INFO] OCR input roi_final shape bed={bed} vital={vital} shape={roi_crop_final.shape}")
+                                print(f"[INFO] OCR input roi_final shape bed={bed} vital={vital} shape={roi_crop_debug.shape}")
                                 if roi_debug_input_dir is not None:
                                     cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
-                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_preprocessed.png"), roi_crop_final)
+                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_preprocessed.png"), roi_crop_debug)
 
-                            text, conf, best_bbox_local, _ocr_results = ocr_one_roi(reader, roi_crop_final)
-                            value = parse_numeric(text, vital, config)
+                            text, value, conf, best_bbox_local, selected_variant = ocr_with_fallback_variants(
+                                reader,
+                                roi_crop_raw,
+                                vital,
+                                config,
+                            )
                             beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
 
                             if args.debug_roi:
                                 if roi_tick_dir is not None:
                                     cv2.imwrite(str(roi_tick_dir / f"roi_{bed}_{vital}.png"), roi_crop_raw)
-                                print(f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} OCR text='{text}'")
+                                print(f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} OCR text='{text}' variant={selected_variant}")
 
                                 if args.debug_full_overlay and full_overlay_img is not None and best_bbox_local:
                                     x1, y1, _x2, _y2 = roi_coords
