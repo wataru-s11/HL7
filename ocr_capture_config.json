@@ -7,6 +7,7 @@
     "top_pad": 0.1,
     "bottom_pad": 0.08
   },
+  "value_roi_inset_px": 2,
   "per_vital_roi_adjust": {
     "RAP_M": {
       "dx1": 2,
@@ -17,9 +18,10 @@
     }
   },
   "preprocess": {
-    "grayscale": true,
-    "threshold": false,
-    "threshold_value": 160,
-    "resize": 1.5
+    "scale": 4.0,
+    "threshold": true,
+    "threshold_value": 170,
+    "trim_px": 3,
+    "morph_kernel": 2
   }
 }
