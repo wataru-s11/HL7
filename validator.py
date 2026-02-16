@@ -185,7 +185,7 @@ def extract_truth_map(truth_json: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def extract_message_datetime(truth_json: dict[str, Any]) -> datetime | None:
-    for key in ("message_datetime", "timestamp", "captured_at", "updated_at"):
+    for key in ("updated_at", "captured_at", "message_datetime", "timestamp"):
         dt = parse_iso8601(truth_json.get(key))
         if dt is not None:
             return dt
@@ -271,18 +271,19 @@ def validate_records(
         truth_map: dict[str, dict[str, Any]],
         truth_payload: dict[str, Any],
         ocr_dt_corrected: datetime | None,
+        truth_dt: datetime | None,
         include_mismatch: bool,
     ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]], float | None, str | None]:
         beds_payload = rec.get("beds", {})
         if not isinstance(beds_payload, dict):
             beds_payload = {}
 
-        truth_dt = extract_message_datetime(truth_payload)
+        resolved_truth_dt = truth_dt if truth_dt is not None else extract_message_datetime(truth_payload)
         dt_sec: float | None = None
         dt_skip_reason: str | None = None
-        if ocr_dt_corrected is not None and truth_dt is not None:
-            dt_sec = (ocr_dt_corrected - truth_dt).total_seconds()
-        elif ocr_dt_corrected is None and truth_dt is None:
+        if ocr_dt_corrected is not None and resolved_truth_dt is not None:
+            dt_sec = (ocr_dt_corrected - resolved_truth_dt).total_seconds()
+        elif ocr_dt_corrected is None and resolved_truth_dt is None:
             dt_skip_reason = "ocr_dt_none+truth_dt_none"
         elif ocr_dt_corrected is None:
             dt_skip_reason = "ocr_dt_none"
@@ -376,6 +377,7 @@ def validate_records(
         selected_payload = monitor_cache_payload
         selected_map = monitor_truth
         selected_snapshot_path: str | None = None
+        selected_truth_dt: datetime | None = None
         selected_source = "monitor_cache_fallback"
         selected_candidate_count = 0
 
@@ -413,6 +415,7 @@ def validate_records(
                     truth_map=truth_map,
                     truth_payload=truth_payload,
                     ocr_dt_corrected=ocr_dt_corrected,
+                    truth_dt=candidate.timestamp,
                     include_mismatch=False,
                 )
                 candidate_delta = (ocr_dt_corrected - candidate.timestamp).total_seconds() if ocr_dt_corrected else float("inf")
@@ -437,6 +440,7 @@ def validate_records(
                     selected_payload = truth_payload
                     selected_map = truth_map
                     selected_snapshot_path = str(candidate.path)
+                    selected_truth_dt = candidate.timestamp
                     selected_source = "cache_dir_search"
 
             if selected_snapshot_path is not None:
@@ -456,6 +460,7 @@ def validate_records(
                         raise ValueError("snapshot is not a JSON object")
                     selected_map = extract_truth_map(selected_payload)
                     selected_snapshot_path = str(snapshot_path)
+                    selected_truth_dt = parse_snapshot_timestamp(snapshot_path)
                     selected_source = "snapshot"
                     snapshot_used += 1
                 except Exception as exc:  # noqa: BLE001
@@ -465,6 +470,7 @@ def validate_records(
                     selected_payload = monitor_cache_payload
                     selected_map = monitor_truth
                     selected_snapshot_path = None
+                    selected_truth_dt = None
                     selected_source = "monitor_cache_fallback"
 
         per_item, score, record_mismatches, dt_sec, dt_skip_reason = evaluate_record(
@@ -472,6 +478,7 @@ def validate_records(
             truth_map=selected_map,
             truth_payload=selected_payload,
             ocr_dt_corrected=ocr_dt_corrected,
+            truth_dt=selected_truth_dt,
             include_mismatch=True,
         )
         chosen_per_item = per_item
