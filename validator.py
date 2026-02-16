@@ -264,8 +264,8 @@ def percentile(values: list[float], p: float) -> float:
 
 def validate_records(
     ocr_records: list[dict[str, Any]],
-    monitor_cache_payload: dict[str, Any],
-    monitor_truth: dict[str, dict[str, Any]],
+    monitor_cache_payload: dict[str, Any] | None,
+    monitor_truth: dict[str, dict[str, Any]] | None,
     ocr_results_path: Path,
     tolerances: dict[str, Any],
     dump_mismatch: int,
@@ -287,14 +287,16 @@ def validate_records(
     matched = 0
     missing = 0
     invalid = 0
-    explicit_used = 0
+    snapshot_before_used = 0
     snapshot_used = 0
-    fallback_used = 0
+    explicit_used = 0
     snapshot_missing = 0
     snapshot_load_error = 0
+    skipped_truth_unavailable = 0
     dt_skipped = 0
     nearest_fallback_used = 0
     dt_skip_reason_counts: Counter[str] = Counter()
+    skip_reason_counts: Counter[str] = Counter()
     snapshot_data_cache: dict[str, SnapshotData] = {}
 
     def evaluate_record(
@@ -406,8 +408,8 @@ def validate_records(
         ocr_dt = parse_iso8601(rec.get("timestamp"))
         ocr_dt_corrected = ocr_dt + timedelta(seconds=lag_sec) if ocr_dt is not None else None
 
-        selected_payload = monitor_cache_payload
-        selected_map = monitor_truth
+        selected_payload: dict[str, Any] = monitor_cache_payload or {}
+        selected_map: dict[str, dict[str, Any]] = monitor_truth or {}
         selected_snapshot_path: str | None = None
         selected_truth_dt: datetime | None = None
         selected_source = "monitor_cache_fallback"
@@ -419,8 +421,8 @@ def validate_records(
         chosen_dt_sec: float | None = None
 
         explicit_candidates = [
-            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
             ("cache_snapshot_path_before", rec.get("cache_snapshot_path_before")),
+            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
         ]
         explicit_selected = False
         for explicit_key, explicit_raw_path in explicit_candidates:
@@ -439,7 +441,10 @@ def validate_records(
                 selected_truth_dt = extract_message_datetime(selected_payload)
                 selected_source = f"explicit:{explicit_key}"
                 selected_dt_source = "explicit_path"
-                explicit_used += 1
+                if explicit_key == "cache_snapshot_path_before":
+                    snapshot_before_used += 1
+                else:
+                    snapshot_used += 1
                 explicit_selected = True
                 break
             except Exception as exc:  # noqa: BLE001
@@ -515,16 +520,27 @@ def validate_records(
                     selected_dt_source = "cache_search"
 
             if selected_snapshot_path is not None:
-                snapshot_used += 1
+                selected_source = "cache_dir_search"
+                selected_dt_source = "cache_search"
 
-        if not explicit_selected and (not cache_candidates or selected_snapshot_path is None):
-            fallback_used += 1
-            selected_payload = monitor_cache_payload
-            selected_map = monitor_truth
-            selected_snapshot_path = None
-            selected_truth_dt = None
-            selected_source = "monitor_cache_fallback"
-            selected_dt_source = "monitor_cache"
+        if not explicit_selected and selected_snapshot_path is None:
+            if monitor_cache_payload is not None and monitor_truth is not None:
+                explicit_used += 1
+                selected_payload = monitor_cache_payload
+                selected_map = monitor_truth
+                selected_snapshot_path = None
+                selected_truth_dt = None
+                selected_source = "monitor_cache_fallback"
+                selected_dt_source = "monitor_cache"
+            else:
+                skipped_truth_unavailable += 1
+                skip_reason = "truth_unavailable"
+                skip_reason_counts[skip_reason] += 1
+                print(
+                    f"[WARN] skip_record reason={skip_reason} "
+                    f"timestamp={rec.get('timestamp')} image_path={rec.get('image_path')}"
+                )
+                continue
 
         per_item, score, record_mismatches, dt_sec, dt_skip_reason = evaluate_record(
             rec=rec,
@@ -579,11 +595,13 @@ def validate_records(
         "median_abs_error": statistics.median(abs_errors) if abs_errors else 0.0,
         "missing_rate": (missing / total) if total else 0.0,
         "invalid_rate": (invalid / total) if total else 0.0,
-        "explicit_used": float(explicit_used),
+        "snapshot_before_used": float(snapshot_before_used),
         "snapshot_used": float(snapshot_used),
-        "fallback_used": float(fallback_used),
+        "explicit_used": float(explicit_used),
         "snapshot_missing": float(snapshot_missing),
         "snapshot_load_error": float(snapshot_load_error),
+        "skipped_truth_unavailable": float(skipped_truth_unavailable),
+        "skip_reason_counts": dict(skip_reason_counts),
         "nearest_fallback_used": float(nearest_fallback_used),
         "dt_mean_seconds": (sum(dt_seconds) / len(dt_seconds)) if dt_seconds else 0.0,
         "dt_median_seconds": statistics.median(dt_seconds) if dt_seconds else 0.0,
@@ -618,7 +636,11 @@ def main() -> None:
         description="Validate OCR JSONL against cache snapshots (or monitor_cache fallback)"
     )
     parser.add_argument("--ocr-results", required=True, help="Path to dataset/.../ocr_results.jsonl")
-    parser.add_argument("--monitor-cache", required=True, help="Path to monitor_cache.json")
+    parser.add_argument(
+        "--monitor-cache",
+        default=None,
+        help="Path to monitor_cache.json used only as final fallback truth source",
+    )
     parser.add_argument("--validator-config", default="validator_config.json", help="Path to validator config JSON")
     parser.add_argument("--last", type=int, default=50, help="Use latest N OCR records")
     parser.add_argument("--cache-dir", default=None, help="Directory containing monitor cache snapshots")
@@ -659,12 +681,12 @@ def main() -> None:
     args = parser.parse_args()
 
     ocr_path = Path(args.ocr_results)
-    cache_path = Path(args.monitor_cache)
+    cache_path = Path(args.monitor_cache) if args.monitor_cache else None
     config_path = Path(args.validator_config)
 
     if not ocr_path.exists():
         raise FileNotFoundError(f"OCR file not found: {ocr_path}")
-    if not cache_path.exists():
+    if cache_path is not None and not cache_path.exists():
         raise FileNotFoundError(f"monitor_cache file not found: {cache_path}")
 
     cfg = ensure_validator_config(config_path)
@@ -672,10 +694,13 @@ def main() -> None:
 
     records = load_recent_records(ocr_path, args.last)
 
-    monitor_cache_payload = json.loads(cache_path.read_text(encoding="utf-8"))
-    if not isinstance(monitor_cache_payload, dict):
-        raise ValueError(f"monitor_cache file is not a JSON object: {cache_path}")
-    monitor_truth = extract_truth_map(monitor_cache_payload)
+    monitor_cache_payload: dict[str, Any] | None = None
+    monitor_truth: dict[str, dict[str, Any]] | None = None
+    if cache_path is not None:
+        monitor_cache_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(monitor_cache_payload, dict):
+            raise ValueError(f"monitor_cache file is not a JSON object: {cache_path}")
+        monitor_truth = extract_truth_map(monitor_cache_payload)
 
     cache_candidates: list[SnapshotCandidate] | None = None
     if args.cache_dir:
@@ -745,10 +770,10 @@ def main() -> None:
     print(f"[INFO] invalid_rate={metrics['invalid_rate']:.4f}")
     print(
         "[INFO] truth_source_stats "
-        f"explicit_used={int(metrics['explicit_used'])} "
+        f"snapshot_before_used={int(metrics['snapshot_before_used'])} "
         f"snapshot_used={int(metrics['snapshot_used'])} "
-        f"fallback_used={int(metrics['fallback_used'])} "
         f"nearest_fallback_used={int(metrics['nearest_fallback_used'])} "
+        f"explicit_used={int(metrics['explicit_used'])} "
         f"snapshot_missing={int(metrics['snapshot_missing'])} "
         f"snapshot_load_error={int(metrics['snapshot_load_error'])}"
     )
@@ -761,6 +786,7 @@ def main() -> None:
         f"skipped={int(metrics['dt_skipped'])}"
     )
     print(f"[INFO] dt_skip_reason_counts={metrics.get('dt_skip_reason_counts', {})}")
+    print(f"[INFO] record_skip_reason_counts={metrics.get('skip_reason_counts', {})}")
 
     if args.dump_mismatch > 0:
         dump_rows = mismatches[: args.dump_mismatch]
