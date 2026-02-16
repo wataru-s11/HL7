@@ -13,6 +13,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import re
 import shutil
@@ -93,6 +94,84 @@ class CaptureRegion:
     top: int
     width: int
     height: int
+
+
+def set_windows_dpi_awareness() -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
+        print("[INFO] DPI awareness enabled via SetProcessDpiAwareness(2)")
+        return
+    except Exception as exc:
+        print(f"[WARN] SetProcessDpiAwareness(2) failed: {exc}", file=sys.stderr)
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+        print("[INFO] DPI awareness enabled via SetProcessDPIAware()")
+    except Exception as exc:
+        print(f"[WARN] SetProcessDPIAware() failed: {exc}", file=sys.stderr)
+
+
+def log_windows_dpi_info() -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        dpi = int(user32.GetDpiForSystem())
+        scale = dpi / 96.0
+        print(f"[INFO] Windows DPI system_dpi={dpi} estimated_scaling={scale:.3f}x")
+        return
+    except Exception as exc:
+        print(f"[WARN] GetDpiForSystem() unavailable: {exc}", file=sys.stderr)
+
+
+def _scale_value(value: int, scale: float) -> int:
+    return int(round(value * scale))
+
+
+def normalize_capture_frame(
+    frame: np.ndarray,
+    capture_region: CaptureRegion,
+    monitor_base: CaptureRegion,
+) -> np.ndarray:
+    """Convert absolute logical capture_rect into frame pixel coordinates.
+
+    Handles DPI mismatch by scaling coordinates when grabbed image size differs
+    from logical monitor_base size.
+    """
+    img_h, img_w = frame.shape[:2]
+    base_w = max(monitor_base.width, 1)
+    base_h = max(monitor_base.height, 1)
+    scale_x = img_w / float(base_w)
+    scale_y = img_h / float(base_h)
+    print(
+        "[INFO] capture_img "
+        f"size={img_w}x{img_h} monitor_rect={base_w}x{base_h} "
+        f"scale_x={scale_x:.6f} scale_y={scale_y:.6f}"
+    )
+
+    rel_x = capture_region.left - monitor_base.left
+    rel_y = capture_region.top - monitor_base.top
+    rel_w = capture_region.width
+    rel_h = capture_region.height
+
+    if abs(scale_x - 1.0) > 1e-6 or abs(scale_y - 1.0) > 1e-6:
+        print("[WARN] logical/physical mismatch detected. Applying ROI scale correction.")
+
+    x = clamp(_scale_value(rel_x, scale_x), 0, max(img_w - 1, 0))
+    y = clamp(_scale_value(rel_y, scale_y), 0, max(img_h - 1, 0))
+    w = max(_scale_value(rel_w, scale_x), 1)
+    h = max(_scale_value(rel_h, scale_y), 1)
+    x2 = clamp(x + w, x + 1, img_w)
+    y2 = clamp(y + h, y + 1, img_h)
+
+    print(
+        "[INFO] final crop(pixel) "
+        f"x={x} y={y} w={x2 - x} h={y2 - y} "
+        f"from capture_rect(left={capture_region.left},top={capture_region.top},"
+        f"width={capture_region.width},height={capture_region.height})"
+    )
+    return frame[y:y2, x:x2].copy()
 
 
 def parse_bool(value: str) -> bool:
@@ -486,6 +565,14 @@ def run_calibration(
 ) -> None:
     base = choose_capture_region(sct, config, monitor_index, mss_monitor_index)
     frame = grab_frame(sct, base)
+    base_img_h, base_img_w = frame.shape[:2]
+    base_scale_x = base_img_w / float(max(base.width, 1))
+    base_scale_y = base_img_h / float(max(base.height, 1))
+    print(
+        "[INFO] calibration base_img "
+        f"size={base_img_w}x{base_img_h} monitor_rect={base.width}x{base.height} "
+        f"scale_x={base_scale_x:.6f} scale_y={base_scale_y:.6f}"
+    )
 
     selected = cv2.selectROI("Select monitor.py region", frame, fromCenter=False, showCrosshair=True)
     cv2.destroyWindow("Select monitor.py region")
@@ -493,9 +580,30 @@ def run_calibration(
     if w <= 0 or h <= 0:
         raise RuntimeError("Calibration cancelled: monitor_rect was not selected.")
 
+    inv_scale_x = 1.0 / base_scale_x if base_scale_x > 0 else 1.0
+    inv_scale_y = 1.0 / base_scale_y if base_scale_y > 0 else 1.0
+    if abs(base_scale_x - 1.0) > 1e-6 or abs(base_scale_y - 1.0) > 1e-6:
+        print("[WARN] calibration selection will be converted from physical px to logical px")
+
+    logical_x = _scale_value(x, inv_scale_x)
+    logical_y = _scale_value(y, inv_scale_y)
+    logical_w = max(_scale_value(w, inv_scale_x), 1)
+    logical_h = max(_scale_value(h, inv_scale_y), 1)
+
     config["monitor_index"] = monitor_index
-    config["monitor_rect"] = {"left": base.left + x, "top": base.top + y, "width": w, "height": h}
-    cropped = frame[y : y + h, x : x + w].copy()
+    config["monitor_rect"] = {
+        "left": base.left + logical_x,
+        "top": base.top + logical_y,
+        "width": logical_w,
+        "height": logical_h,
+    }
+    capture_region = CaptureRegion(
+        left=base.left + logical_x,
+        top=base.top + logical_y,
+        width=logical_w,
+        height=logical_h,
+    )
+    cropped = normalize_capture_frame(frame, capture_region, base)
     reader = easyocr.Reader(["en"], gpu=use_gpu)
 
     win = "Calibration (s=save, q=quit)"
@@ -504,7 +612,7 @@ def run_calibration(
     def add_trackbar(name: str, value: int, max_value: int) -> None:
         cv2.createTrackbar(name, win, value, max_value, lambda _v: None)
 
-    add_trackbar("header_crop_px", int(config.get("header_crop_px", 60)), max(1, h - 1))
+    add_trackbar("header_crop_px", int(config.get("header_crop_px", 60)), max(1, cropped.shape[0] - 1))
     value_box = config.setdefault("value_box", dict(DEFAULT_CONFIG["value_box"]))
     add_trackbar("value_x1(%)", int(float(value_box.get("x1_ratio", 0.58)) * 100), 99)
     add_trackbar("value_x2(%)", int(float(value_box.get("x2_ratio", 0.98)) * 100), 100)
@@ -575,6 +683,9 @@ def main() -> None:
     parser.add_argument("--calibrate", action="store_true")
     args = parser.parse_args()
 
+    set_windows_dpi_awareness()
+    log_windows_dpi_info()
+
     config_path = Path(args.config)
     config = ensure_config(config_path)
     cache_path = Path(args.cache)
@@ -620,7 +731,8 @@ def main() -> None:
                     if args.save_images:
                         images_dir.mkdir(parents=True, exist_ok=True)
 
-                    frame = grab_frame(sct, capture_rect)
+                    base_frame = grab_frame(sct, monitor_base)
+                    frame = normalize_capture_frame(base_frame, capture_rect, monitor_base)
                     rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
