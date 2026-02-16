@@ -8,15 +8,15 @@ OCR前提: 白背景・黒文字・桁固定(等幅フォント)。
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import font
-
-from screeninfo import get_monitors
-
 
 BED_IDS = [f"BED0{i}" for i in range(1, 7)]
 VITAL_ORDER = [
@@ -49,6 +49,91 @@ CELL_BORDER_MARGIN = 0
 VALUE_TOP_MARGIN = 2
 VALUE_BOTTOM_MARGIN = 3
 VALUE_TARGET_RELY = 0.45
+MONITORINFOF_PRIMARY = 0x00000001
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+
+def dpi_aware() -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
+        print("[INFO] DPI awareness enabled via SetProcessDpiAwareness(2)")
+        return
+    except Exception as exc:
+        print(f"[WARN] SetProcessDpiAwareness(2) failed: {exc}", file=sys.stderr)
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+        print("[INFO] DPI awareness enabled via SetProcessDPIAware()")
+    except Exception as exc:
+        print(f"[WARN] SetProcessDPIAware() failed: {exc}", file=sys.stderr)
+
+
+def enum_windows_monitors() -> list[dict[str, int | bool]]:
+    if not sys.platform.startswith("win"):
+        print("[WARN] Windows monitor enumeration is only available on Windows", file=sys.stderr)
+        return []
+
+    monitors: list[dict[str, int | bool]] = []
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    monitor_enum_proc = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(RECT),
+        wintypes.LPARAM,
+    )
+
+    def callback(hmonitor, _hdc, _lprc, _lparam):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        ok = user32.GetMonitorInfoW(hmonitor, ctypes.byref(info))
+        if not ok:
+            print(f"[WARN] GetMonitorInfoW failed for hmonitor={hmonitor}", file=sys.stderr)
+            return 1
+
+        left = int(info.rcMonitor.left)
+        top = int(info.rcMonitor.top)
+        width = int(info.rcMonitor.right - info.rcMonitor.left)
+        height = int(info.rcMonitor.bottom - info.rcMonitor.top)
+        is_primary = bool(info.dwFlags & MONITORINFOF_PRIMARY)
+        idx = len(monitors) + 1
+        monitor = {
+            "index": idx,
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "is_primary": is_primary,
+        }
+        monitors.append(monitor)
+        print(
+            "[INFO] monitor "
+            f"index={idx} left={left} top={top} width={width} height={height} is_primary={is_primary}"
+        )
+        return 1
+
+    try:
+        user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(callback), 0)
+    except Exception as exc:
+        print(f"[WARN] EnumDisplayMonitors failed: {exc}", file=sys.stderr)
+        return []
+    return monitors
+
+
+def pick_primary_monitor(monitors: list[dict[str, int | bool]]) -> dict[str, int | bool] | None:
+    for monitor in monitors:
+        if bool(monitor.get("is_primary", False)):
+            return monitor
+    print("[WARN] Primary monitor not found", file=sys.stderr)
+    return monitors[0] if monitors else None
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -231,20 +316,21 @@ class MonitorApp:
         self.root.after(200, self.redraw_all)
 
     def apply_screen_placement(self):
-        monitors = get_monitors()
-        idx = 1 if len(monitors) > 1 else 0
-        target_monitor = monitors[idx]
+        monitors = enum_windows_monitors()
+        target_monitor = pick_primary_monitor(monitors)
+        if not target_monitor:
+            print("[WARN] Falling back to default Tk geometry", file=sys.stderr)
+            return
 
+        left = int(target_monitor["left"])
+        top = int(target_monitor["top"])
+        width = int(target_monitor["width"])
+        height = int(target_monitor["height"])
         print(
-            f"[INFO] Launching monitor on monitor index={idx} "
-            f"({target_monitor.width}x{target_monitor.height} at "
-            f"{target_monitor.x},{target_monitor.y})"
+            "[INFO] Launching monitor on primary "
+            f"index={target_monitor['index']} left={left} top={top} width={width} height={height}"
         )
-
-        self.root.geometry(
-            f"{target_monitor.width}x{target_monitor.height}"
-            f"+{target_monitor.x}+{target_monitor.y}"
-        )
+        self.root.geometry(f"{width}x{height}+{left}+{top}")
 
 
     def on_escape(self, _event):
@@ -491,6 +577,7 @@ def parse_bool(value: str) -> bool:
 
 
 def main() -> None:
+    dpi_aware()
     parser = argparse.ArgumentParser(description="HL7 monitor GUI")
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--refresh-ms", type=int, default=1000, help="JSON再読込周期(ms)")
