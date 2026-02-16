@@ -933,7 +933,6 @@ def _easyocr_read_numeric(
         paragraph=False,
         allowlist=allowlist,
         decoder="greedy",
-        detector=False,
     )
     parsed: list[tuple[str, float | None]] = []
     for row in results:
@@ -964,9 +963,9 @@ def ocr_numeric_roi(
     otsu_inv = binarize(gray, invert=True)
 
     pass_images: list[tuple[str, np.ndarray]] = [
-        ("passA_gray", gray),
-        ("passB_otsu", otsu),
-        ("passB_otsu_inv", otsu_inv),
+        ("gray", gray),
+        ("otsu", otsu),
+        ("otsu_inv", otsu_inv),
     ]
 
     candidates: list[dict[str, Any]] = []
@@ -984,7 +983,7 @@ def ocr_numeric_roi(
                     "text": norm_text,
                     "value": parsed_value,
                     "conf": conf,
-                    "method": "detector_false",
+                    "method": "preprocess_multi_pass",
                     "ocr_pass": pass_name,
                 }
             )
@@ -998,7 +997,6 @@ def ocr_numeric_roi(
             "method": winner["method"],
             "ocr_pass": winner["ocr_pass"],
             "imputed": False,
-            "debug": {"raw_easyocr": raw_easyocr},
         }
 
     if prior_value is not None:
@@ -1009,7 +1007,6 @@ def ocr_numeric_roi(
             "method": "hold_last",
             "ocr_pass": "none",
             "imputed": True,
-            "debug": {"raw_easyocr": raw_easyocr},
         }
 
     if debug_dir is not None:
@@ -1026,7 +1023,10 @@ def ocr_numeric_roi(
         "method": "no_match",
         "ocr_pass": "none",
         "imputed": False,
-        "debug": {"raw_easyocr": raw_easyocr},
+        "debug": {
+            "preprocess_passes": [name for name, _ in pass_images],
+            "raw_easyocr": raw_easyocr,
+        },
     }
 
 
