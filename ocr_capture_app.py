@@ -2267,70 +2267,26 @@ def main() -> None:
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "no_roi", "imputed": False, "ocr_pass": "none"}
                                 continue
 
-                            roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
-                            if roi_crop_raw is None or roi_coords is None:
-                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
-                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "crop_failed", "imputed": False, "ocr_pass": "none"}
-                                continue
+                            try:
+                                roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
+                                if roi_crop_raw is None or roi_coords is None:
+                                    missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                    beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "crop_failed", "imputed": False, "ocr_pass": "none"}
+                                    continue
 
-                            if args.debug_roi and roi_debug_input_dir is not None:
-                                cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
+                                if args.debug_roi and roi_debug_input_dir is not None:
+                                    cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
 
-                            if vital in {"CVP_M", "RAP_M"}:
-                                print(f"[INFO] fixed_roi_coords bed={bed} field={vital} coords={roi_coords}")
+                                if vital in {"CVP_M", "RAP_M"}:
+                                    print(f"[INFO] fixed_roi_coords bed={bed} field={vital} coords={roi_coords}")
 
-                            prior_value = last_confirmed_values.get(bed, {}).get(vital)
-                            ocr_result = ocr_numeric_roi(
-                                roi_crop_raw,
-                                reader_det,
-                                reader_rec,
-                                field_name=vital,
-                                prior_value=prior_value,
-                            )
-                            text = str(ocr_result.get("text") or "")
-                            value = ocr_result.get("value")
-                            conf_value = safe_float(ocr_result.get("conf"))
-                            conf = conf_value if conf_value is not None else 0.0
-                            method = str(ocr_result.get("method") or "none")
-                            ocr_pass = str(ocr_result.get("ocr_pass") or "none")
-                            imputed = bool(ocr_result.get("imputed", False))
-
-                            beds[bed][vital] = {
-                                "text": text,
-                                "value": value,
-                                "confidence": conf,
-                                "ocr_method": method,
-                                "ocr_conf": conf_value,
-                                "imputed": imputed,
-                                "ocr_pass": ocr_pass,
-                            }
-
-                            if value is not None and not imputed:
-                                last_confirmed_values.setdefault(bed, {})[vital] = value
-
-                            if not text:
-                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
-                                bed_debug[vital] = ocr_result.get("debug", {})
-
-                            save_target = fail_roi_fields is None or vital in fail_roi_fields
-                            should_save, save_reason = should_save_failed_roi(ocr_result, text, value)
-                            if (
-                                args.save_fail_roi
-                                and save_target
-                                and should_save
-                                and fail_roi_saved_in_tick < max(int(args.fail_roi_max_per_tick), 0)
-                            ):
-                                saved_files = save_failed_roi_artifacts(
-                                    fail_roi_dir,
-                                    timestamp=stamp,
-                                    bed=bed,
-                                    field=vital,
-                                    roi_coords=roi_coords,
-                                    ocr_result=ocr_result,
-                                )
-                                fail_roi_saved_in_tick += 1
-                                print(
-                                    f"[WARN] ocr_fail_saved bed={bed} field={vital} files={','.join(saved_files)} reason={save_reason}"
+                                prior_value = last_confirmed_values.get(bed, {}).get(vital)
+                                ocr_result = ocr_numeric_roi(
+                                    roi_crop_raw,
+                                    reader_det,
+                                    reader_rec,
+                                    field_name=vital,
+                                    prior_value=prior_value,
                                 )
                                 text = str(ocr_result.get("text") or "")
                                 value = ocr_result.get("value")
