@@ -78,7 +78,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "x1_ratio": 0.58,
         "x2_ratio": 0.98,
         "y1_ratio": 0.20,
-        "y2_ratio": 0.85,
+        "y2_ratio": 0.88,
         "pad_px": 2,
     },
     # MOD: vital別ROI微調整設定を追加（px/ratioの両対応）
@@ -278,8 +278,48 @@ def _offset_from_adjust(adjust: dict[str, Any], key: str, cell_w: int, cell_h: i
     return int(round(raw_value))
 
 
-def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> dict[str, dict[str, tuple[int, int, int, int]]]:
-    frame_h, frame_w = frame_shape
+def detect_bed_grid_top(bed_img: np.ndarray, fallback_ratio: float = 0.22) -> tuple[int, int | None, float]:
+    """Detect the header bottom horizontal line inside one bed image.
+
+    Returns:
+        grid_top: y offset where 5x4 vital grid starts (relative to bed image)
+        header_bottom_line_y: detected line y, or None when fallback is used
+        line_ratio: black-pixel ratio at detected row (0.0 on fallback)
+    """
+    bed_h, bed_w = bed_img.shape[:2]
+    if bed_h <= 2 or bed_w <= 2:
+        fallback_top = clamp(int(round(bed_h * fallback_ratio)), 0, max(bed_h - 1, 0))
+        return fallback_top, None, 0.0
+
+    gray = cv2.cvtColor(bed_img, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)
+
+    y_start = clamp(int(bed_h * 0.10), 0, bed_h - 1)
+    y_end = clamp(int(bed_h * 0.40), y_start + 1, bed_h)
+
+    black = (binary == 0).astype(np.uint8)
+    row_black_ratio = black[y_start:y_end].sum(axis=1) / float(bed_w)
+    best_idx = int(np.argmax(row_black_ratio))
+    best_ratio = float(row_black_ratio[best_idx])
+    detected_y = y_start + best_idx
+
+    min_line_ratio = 0.08
+    if best_ratio < min_line_ratio:
+        fallback_top = clamp(int(round(bed_h * fallback_ratio)), 0, bed_h - 1)
+        return fallback_top, None, best_ratio
+
+    grid_top = clamp(detected_y + 2, 0, bed_h - 1)
+    return grid_top, detected_y, best_ratio
+
+
+def build_vital_rois(
+    frame: np.ndarray,
+    config: dict[str, Any],
+    return_debug: bool = False,
+) -> dict[str, dict[str, tuple[int, int, int, int]]] | tuple[
+    dict[str, dict[str, tuple[int, int, int, int]]], dict[str, dict[str, int | float | bool | None]]
+]:
+    frame_h, frame_w = frame.shape[:2]
     header_crop_px = clamp(int(config.get("header_crop_px", 60)), 0, frame_h - 1)
     body_top = header_crop_px
     body_h = max(frame_h - body_top, 1)
@@ -300,12 +340,13 @@ def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> di
         value_x1_ratio = float(value_box_cfg.get("x1_ratio", 0.58))
         value_x2_ratio = float(value_box_cfg.get("x2_ratio", 0.98))
         value_y1_ratio = float(value_box_cfg.get("y1_ratio", 0.20))
-        value_y2_ratio = float(value_box_cfg.get("y2_ratio", 0.85))
+        value_y2_ratio = float(value_box_cfg.get("y2_ratio", 0.88))
         value_pad_px = max(int(value_box_cfg.get("pad_px", 2)), 0)
 
     adjust_cfg = config.get("per_vital_roi_adjust", {})
 
     out: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
+    debug_meta: dict[str, dict[str, int | float | bool | None]] = {}
 
     for bed_idx, bed in enumerate(BED_IDS):
         bed_row = bed_idx // bed_cols
@@ -319,14 +360,34 @@ def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> di
         bed_w = max(bx2 - bx1, 1)
         bed_h = max(by2 - by1, 1)
 
+        bed_img = frame[by1:by2, bx1:bx2]
+        grid_top, detected_line_y, line_ratio = detect_bed_grid_top(bed_img)
+
+        grid_y1 = by1 + grid_top
+        grid_y2 = by2
+        grid_h = max(grid_y2 - grid_y1, 1)
+
+        debug_meta[bed] = {
+            "bed_x1": bx1,
+            "bed_y1": by1,
+            "bed_x2": bx2,
+            "bed_y2": by2,
+            "grid_top": grid_top,
+            "grid_y1": grid_y1,
+            "grid_y2": grid_y2,
+            "header_bottom_line_y": (by1 + detected_line_y) if detected_line_y is not None else None,
+            "line_ratio": line_ratio,
+            "header_line_detected": detected_line_y is not None,
+        }
+
         for idx, vital in enumerate(VITAL_ORDER):
             c_row = idx // cell_cols
             c_col = idx % cell_cols
 
             cx1 = bx1 + int((c_col * bed_w) / cell_cols)
             cx2 = bx1 + int(((c_col + 1) * bed_w) / cell_cols)
-            cy1 = by1 + int((c_row * bed_h) / cell_rows)
-            cy2 = by1 + int(((c_row + 1) * bed_h) / cell_rows)
+            cy1 = grid_y1 + int((c_row * grid_h) / cell_rows)
+            cy2 = grid_y1 + int(((c_row + 1) * grid_h) / cell_rows)
 
             cw, ch = max(cx2 - cx1, 1), max(cy2 - cy1, 1)
 
@@ -351,7 +412,6 @@ def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> di
                 vy1 = clamp(cy1 + int(ch * top_pad), cy1, cy2 - 1)
                 vy2 = clamp(cy2 - int(ch * bottom_pad), vy1 + 1, cy2)
 
-            # MOD: vital毎のROI補正を適用
             vital_adjust = adjust_cfg.get(vital) if isinstance(adjust_cfg, dict) else None
             if isinstance(vital_adjust, dict):
                 vx1 = clamp(vx1 + _offset_from_adjust(vital_adjust, "dx1", cw, ch), cx1, cx2 - 1)
@@ -360,6 +420,9 @@ def build_vital_rois(frame_shape: tuple[int, int], config: dict[str, Any]) -> di
                 vy2 = clamp(vy2 + _offset_from_adjust(vital_adjust, "dy2", cw, ch), vy1 + 1, cy2)
 
             out[bed][vital] = (vx1, vy1, vx2, vy2)
+
+    if return_debug:
+        return out, debug_meta
     return out
 
 
@@ -446,7 +509,7 @@ def run_calibration(
     add_trackbar("value_x1(%)", int(float(value_box.get("x1_ratio", 0.58)) * 100), 99)
     add_trackbar("value_x2(%)", int(float(value_box.get("x2_ratio", 0.98)) * 100), 100)
     add_trackbar("value_y1(%)", int(float(value_box.get("y1_ratio", 0.20)) * 100), 99)
-    add_trackbar("value_y2(%)", int(float(value_box.get("y2_ratio", 0.85)) * 100), 100)
+    add_trackbar("value_y2(%)", int(float(value_box.get("y2_ratio", 0.88)) * 100), 100)
     add_trackbar("pad_px", int(value_box.get("pad_px", 2)), 20)
 
     while True:
@@ -461,7 +524,7 @@ def run_calibration(
         config["value_box"]["y2_ratio"] = max(value_y1, value_y2) / 100.0
         config["value_box"]["pad_px"] = cv2.getTrackbarPos("pad_px", win)
 
-        rois = build_vital_rois((h, w), config)
+        rois = build_vital_rois(cropped, config)
         x1, y1, x2, y2 = rois["BED01"]["RAP_M"]
         roi_img = cropped[y1:y2, x1:x2]
         text, conf = run_ocr(reader, preprocess_image(roi_img, config))
@@ -558,7 +621,7 @@ def main() -> None:
                         images_dir.mkdir(parents=True, exist_ok=True)
 
                     frame = grab_frame(sct, capture_rect)
-                    rois = build_vital_rois((frame.shape[0], frame.shape[1]), config)
+                    rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
                     image_path = None
@@ -567,23 +630,37 @@ def main() -> None:
                         cv2.imwrite(str(image_path), frame)
 
                     if args.debug_roi:
-                        # MOD: debug-roiにbed/vital名を描画
                         debug_dir.mkdir(parents=True, exist_ok=True)
                         debug_img = frame.copy()
                         for bed in BED_IDS:
+                            meta = roi_debug.get(bed, {})
+                            bx1 = int(meta.get("bed_x1", 0))
+                            by1 = int(meta.get("bed_y1", 0))
+                            bx2 = int(meta.get("bed_x2", 0))
+                            by2 = int(meta.get("bed_y2", 0))
+                            gy1 = int(meta.get("grid_y1", by1))
+                            gy2 = int(meta.get("grid_y2", by2))
+                            header_line = meta.get("header_bottom_line_y")
+
+                            if header_line is not None:
+                                hy = int(header_line)
+                                cv2.line(debug_img, (bx1, hy), (bx2 - 1, hy), (0, 255, 0), 2)
+
+                            cv2.rectangle(debug_img, (bx1, gy1), (bx2 - 1, gy2 - 1), (255, 0, 0), 2)
+                            cv2.putText(
+                                debug_img,
+                                f"{bed} grid_top={int(meta.get('grid_top', 0))}",
+                                (bx1 + 3, max(gy1 - 6, 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.35,
+                                (255, 255, 0),
+                                1,
+                                cv2.LINE_AA,
+                            )
+
                             for vital in VITAL_ORDER:
                                 x1, y1, x2, y2 = rois[bed][vital]
                                 cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
-                                cv2.putText(
-                                    debug_img,
-                                    f"{bed}:{vital}",
-                                    (x1 + 1, max(y1 + 11, 11)),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.28,
-                                    (255, 0, 0),
-                                    1,
-                                    cv2.LINE_AA,
-                                )
                         cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
 
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
