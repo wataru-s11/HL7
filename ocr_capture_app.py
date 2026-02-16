@@ -32,11 +32,6 @@ import mss
 import numpy as np
 import torch
 
-try:
-    import pygetwindow as gw
-except Exception:  # pragma: no cover
-    gw = None
-
 BED_IDS = [f"BED0{i}" for i in range(1, 7)]
 VITAL_ORDER = [
     "HR",
@@ -104,6 +99,93 @@ class CaptureRegion:
     top: int
     width: int
     height: int
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def find_monitor_window_hwnd(title: str) -> int | None:
+    if not sys.platform.startswith("win"):
+        return None
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    query = title.strip()
+    if not query:
+        return None
+
+    try:
+        hwnd = int(user32.FindWindowW(None, query))
+        if hwnd:
+            return hwnd
+    except Exception as exc:
+        print(f"[WARN] FindWindowW failed: {exc}", file=sys.stderr)
+
+    matches: list[int] = []
+
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = int(user32.GetWindowTextLengthW(hwnd))
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        text = buf.value or ""
+        if query.lower() in text.lower():
+            matches.append(int(hwnd))
+            return False
+        return True
+
+    try:
+        user32.EnumWindows(enum_proc(callback), 0)
+    except Exception as exc:
+        print(f"[WARN] EnumWindows failed: {exc}", file=sys.stderr)
+        return None
+
+    return matches[0] if matches else None
+
+
+def get_window_capture_region(title: str, capture_client: bool) -> CaptureRegion | None:
+    if not sys.platform.startswith("win"):
+        return None
+
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    hwnd = find_monitor_window_hwnd(title)
+    if not hwnd:
+        return None
+
+    if capture_client:
+        client_rect = RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(client_rect)):
+            return None
+
+        left_top = POINT(client_rect.left, client_rect.top)
+        right_bottom = POINT(client_rect.right, client_rect.bottom)
+        if not user32.ClientToScreen(hwnd, ctypes.byref(left_top)):
+            return None
+        if not user32.ClientToScreen(hwnd, ctypes.byref(right_bottom)):
+            return None
+
+        left = int(left_top.x)
+        top = int(left_top.y)
+        width = int(right_bottom.x - left_top.x)
+        height = int(right_bottom.y - left_top.y)
+    else:
+        window_rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
+            return None
+        left = int(window_rect.left)
+        top = int(window_rect.top)
+        width = int(window_rect.right - window_rect.left)
+        height = int(window_rect.bottom - window_rect.top)
+
+    if width <= 0 or height <= 0:
+        return None
+
+    return CaptureRegion(left=left, top=top, width=width, height=height)
 
 
 def dpi_aware() -> None:
@@ -378,21 +460,6 @@ def save_config(path: Path, config: dict[str, Any]) -> None:
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def find_window_region(title: str) -> CaptureRegion | None:
-    if gw is None:
-        return None
-    try:
-        windows = gw.getWindowsWithTitle(title)
-    except Exception:
-        return None
-    if not windows:
-        return None
-    win = windows[0]
-    if win.width <= 0 or win.height <= 0:
-        return None
-    return CaptureRegion(int(win.left), int(win.top), int(win.width), int(win.height))
-
-
 def log_monitors(sct: mss.mss) -> None:
     # MOD: 起動時に常に利用可能monitor情報を表示
     for idx, monitor in enumerate(sct.monitors):
@@ -423,6 +490,13 @@ def choose_capture_region(
 def grab_frame(sct: mss.mss, region: CaptureRegion) -> np.ndarray:
     raw = sct.grab({"left": region.left, "top": region.top, "width": region.width, "height": region.height})
     return cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2BGR)
+
+
+def write_debug_window_rect_image(path: Path, frame: np.ndarray) -> None:
+    debug = frame.copy()
+    h, w = debug.shape[:2]
+    cv2.rectangle(debug, (0, 0), (max(w - 1, 0), max(h - 1, 0)), (255, 0, 0), 3)
+    cv2.imwrite(str(path), debug)
 
 
 def clamp(v: int, lo: int, hi: int) -> int:
@@ -817,12 +891,16 @@ def main() -> None:
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--config", default="ocr_capture_config.json")
     parser.add_argument("--outdir", default="dataset")
+    parser.add_argument("--capture-mode", choices=["window", "mss"], default="window")
+    parser.add_argument("--window-title", default="HL7 Bed Monitor")
+    parser.add_argument("--capture-client", type=parse_bool, default=True)
     parser.add_argument("--target-display", choices=["primary", "index", "mss"], default="primary")
     parser.add_argument("--display-index", type=int, default=None)
     parser.add_argument("--mss-monitor-index", type=int, default=None)
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
+    parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
     parser.add_argument("--gpu", type=parse_bool, default=True)
     parser.add_argument("--no-launch-monitor", type=parse_bool, default=True)  # MOD: 安全側デフォルト
     parser.add_argument("--run-validator", type=parse_bool, default=False)  # MOD
@@ -836,6 +914,7 @@ def main() -> None:
 
     config_path = Path(args.config)
     config = ensure_config(config_path)
+    config["window_title"] = args.window_title
     cache_path = Path(args.cache)
     validator_config = Path(args.validator_config)
 
@@ -852,12 +931,12 @@ def main() -> None:
     launched_monitor = maybe_launch_monitor(args.no_launch_monitor, cache_path)
 
     windows_monitors = enum_windows_monitors()
-    if args.target_display in {"primary", "index", "mss"}:
-        print(f"[INFO] target-display={args.target_display}: window-title capture is disabled")
 
     with mss.mss() as sct:
         log_monitors(sct)
         if args.calibrate:
+            if args.capture_mode == "window":
+                print("[WARN] calibration currently uses mss capture settings; --capture-mode window is ignored during calibration")
             run_calibration(
                 sct,
                 config_path,
@@ -872,23 +951,22 @@ def main() -> None:
 
         reader = easyocr.Reader(["en"], gpu=use_gpu)
 
-        monitor_base = choose_capture_region(
-            sct,
-            args.target_display,
-            windows_monitors,
-            args.display_index,
-            args.mss_monitor_index,
-        )
-        capture_rect = get_monitor_rect(config, monitor_base)
-        print(
-            "[INFO] final capture rect "
-            f"left={capture_rect.left} top={capture_rect.top} width={capture_rect.width} height={capture_rect.height}"
-        )
+        mss_monitor_base: CaptureRegion | None = None
+        mss_capture_rect: CaptureRegion | None = None
+        if args.capture_mode == "mss":
+            mss_monitor_base = choose_capture_region(
+                sct,
+                args.target_display,
+                windows_monitors,
+                args.display_index,
+                args.mss_monitor_index,
+            )
+            mss_capture_rect = get_monitor_rect(config, mss_monitor_base)
 
         try:
             while True:
                 tick = time.time()
-                print(f"[INFO] capture tick start ts={datetime.now().isoformat(timespec='seconds')}")  # MOD
+                print(f"[INFO] capture tick start ts={datetime.now().isoformat(timespec='seconds')}")
                 try:
                     day = datetime.now().strftime("%Y%m%d")
                     day_dir = Path(args.outdir) / day
@@ -898,8 +976,33 @@ def main() -> None:
                     if args.save_images:
                         images_dir.mkdir(parents=True, exist_ok=True)
 
-                    base_frame = grab_frame(sct, monitor_base)
-                    frame = normalize_capture_frame(base_frame, capture_rect, monitor_base)
+                    capture_rect: CaptureRegion | None = None
+                    frame: np.ndarray | None = None
+
+                    if args.capture_mode == "window":
+                        capture_rect = get_window_capture_region(args.window_title, args.capture_client)
+                        if capture_rect is None:
+                            print(f"[INFO] window found=not found title='{args.window_title}'")
+                            raise RuntimeError("monitor window not found")
+
+                        print(f"[INFO] window found=found title='{args.window_title}'")
+                        frame = grab_frame(sct, capture_rect)
+                    else:
+                        assert mss_monitor_base is not None
+                        assert mss_capture_rect is not None
+                        capture_rect = mss_capture_rect
+                        print("[INFO] window found=not applicable capture-mode=mss")
+                        base_frame = grab_frame(sct, mss_monitor_base)
+                        frame = normalize_capture_frame(base_frame, capture_rect, mss_monitor_base)
+
+                    assert capture_rect is not None
+                    assert frame is not None
+                    print(
+                        "[INFO] capture rect "
+                        f"left={capture_rect.left} top={capture_rect.top} width={capture_rect.width} height={capture_rect.height}"
+                    )
+                    print(f"[INFO] grab image size width={frame.shape[1]} height={frame.shape[0]}")
+
                     rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
@@ -907,6 +1010,10 @@ def main() -> None:
                     if args.save_images:
                         image_path = images_dir / f"{stamp}.png"
                         cv2.imwrite(str(image_path), frame)
+
+                    if args.debug_window_rect:
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        write_debug_window_rect_image(debug_dir / f"{stamp}_window_rect.png", frame)
 
                     if args.debug_roi:
                         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -972,7 +1079,7 @@ def main() -> None:
                     print(f"[WARN] frame skipped due to error: {exc}", file=sys.stderr)
 
                 sleep_ms = max(args.interval_ms - (time.time() - tick) * 1000, 0)
-                print(f"[INFO] sleeping {sleep_ms:.1f} ms")  # MOD
+                print(f"[INFO] sleeping {sleep_ms:.1f} ms")
                 time.sleep(sleep_ms / 1000.0)
         finally:
             # MOD: 起動したmonitorプロセスを安全終了
