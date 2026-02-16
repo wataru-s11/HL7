@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 from collections import deque
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +72,40 @@ def parse_iso8601(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         return None
     return dt
+
+
+JST = timezone(timedelta(hours=9))
+SNAPSHOT_FILENAME_PATTERN = re.compile(r"(\d{8})_(\d{6})_(\d{3})_monitor_cache\.json$")
+
+
+@dataclass
+class SnapshotCandidate:
+    path: Path
+    timestamp: datetime
+
+
+def parse_snapshot_timestamp(path: Path) -> datetime:
+    match = SNAPSHOT_FILENAME_PATTERN.search(path.name)
+    if match:
+        day_part, time_part, ms_part = match.groups()
+        parsed = datetime.strptime(day_part + time_part + ms_part, "%Y%m%d%H%M%S%f")
+        return parsed.replace(tzinfo=JST)
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=JST)
+
+
+def load_snapshot_candidates(cache_dir: Path) -> list[SnapshotCandidate]:
+    if not cache_dir.exists() or not cache_dir.is_dir():
+        return []
+
+    candidates: list[SnapshotCandidate] = []
+    for path in cache_dir.glob("*_monitor_cache.json"):
+        try:
+            ts = parse_snapshot_timestamp(path)
+            candidates.append(SnapshotCandidate(path=path, timestamp=ts))
+        except OSError:
+            continue
+    candidates.sort(key=lambda item: item.timestamp)
+    return candidates
 
 
 def ensure_validator_config(path: Path) -> dict[str, Any]:
@@ -192,6 +228,10 @@ def validate_records(
     ocr_results_path: Path,
     tolerances: dict[str, Any],
     dump_mismatch: int,
+    cache_candidates: list[SnapshotCandidate] | None,
+    lookback_sec: float,
+    max_candidates: int,
+    lag_sec: float,
 ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]]]:
     details: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -209,44 +249,27 @@ def validate_records(
     snapshot_load_error = 0
     dt_skipped = 0
 
-    for rec in ocr_records:
+    def evaluate_record(
+        rec: dict[str, Any],
+        truth_map: dict[str, dict[str, Any]],
+        truth_payload: dict[str, Any],
+        ocr_dt_corrected: datetime | None,
+        include_mismatch: bool,
+    ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]], float | None]:
         beds_payload = rec.get("beds", {})
         if not isinstance(beds_payload, dict):
             beds_payload = {}
 
-        snapshot_source = "monitor_cache_fallback"
-        truth_payload = monitor_cache_payload
-        truth_map = monitor_truth
-
-        snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path"), ocr_results_path)
-        if snapshot_path is None:
-            snapshot_missing += 1
-            fallback_used += 1
-        else:
-            try:
-                truth_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-                if not isinstance(truth_payload, dict):
-                    raise ValueError("snapshot is not a JSON object")
-                truth_map = extract_truth_map(truth_payload)
-                snapshot_source = "snapshot"
-                snapshot_used += 1
-            except Exception as exc:  # noqa: BLE001
-                print(f"[WARN] failed to load snapshot {snapshot_path}: {exc}")
-                snapshot_load_error += 1
-                fallback_used += 1
-                truth_payload = monitor_cache_payload
-                truth_map = monitor_truth
-
-        ocr_dt = parse_iso8601(rec.get("timestamp"))
         truth_dt = extract_message_datetime(truth_payload)
         dt_sec: float | None = None
-        if ocr_dt is not None and truth_dt is not None:
-            dt_sec = abs((ocr_dt - truth_dt).total_seconds())
-            dt_seconds.append(dt_sec)
-        else:
-            dt_skipped += 1
+        if ocr_dt_corrected is not None and truth_dt is not None:
+            dt_sec = (ocr_dt_corrected - truth_dt).total_seconds()
 
         per_item: list[dict[str, Any]] = []
+        record_abs_errors: list[float] = []
+        record_mismatches: list[dict[str, Any]] = []
+        record_total = 0
+        record_matched = 0
         for bed, truth_vitals in truth_map.items():
             if not isinstance(truth_vitals, dict):
                 continue
@@ -255,7 +278,7 @@ def validate_records(
                 ocr_bed_payload = {}
 
             for vital, truth_raw in truth_vitals.items():
-                total += 1
+                record_total += 1
                 truth_value = safe_float(truth_raw)
 
                 ocr_vital_payload = ocr_bed_payload.get(vital, {})
@@ -273,16 +296,13 @@ def validate_records(
                 is_match = False
                 abs_error: float | None = None
                 if truth_value is None or ocr_value is None:
-                    if ocr_value is None:
-                        missing += 1
-                    if invalid_reason:
-                        invalid += 1
+                    pass
                 else:
                     abs_error = abs(ocr_value - truth_value)
-                    abs_errors.append(abs_error)
+                    record_abs_errors.append(abs_error)
                     is_match = abs_error <= tolerance
                     if is_match:
-                        matched += 1
+                        record_matched += 1
 
                 comparison = {
                     "bed": bed,
@@ -301,9 +321,9 @@ def validate_records(
                 }
                 per_item.append(comparison)
 
-                if not is_match:
+                if include_mismatch and not is_match:
                     mismatch_error = abs_error if abs_error is not None else float("inf")
-                    mismatches.append(
+                    record_mismatches.append(
                         {
                             "bed": bed,
                             "vital": vital,
@@ -317,13 +337,143 @@ def validate_records(
                         }
                     )
 
+        mean_abs = (sum(record_abs_errors) / len(record_abs_errors)) if record_abs_errors else float("inf")
+        score = {
+            "total": float(record_total),
+            "matched": float(record_matched),
+            "mean_abs_error": mean_abs,
+        }
+        return per_item, score, record_mismatches, dt_sec
+
+    for rec in ocr_records:
+        ocr_dt = parse_iso8601(rec.get("timestamp"))
+        ocr_dt_corrected = ocr_dt + timedelta(seconds=lag_sec) if ocr_dt is not None else None
+
+        selected_payload = monitor_cache_payload
+        selected_map = monitor_truth
+        selected_snapshot_path: str | None = None
+        selected_source = "monitor_cache_fallback"
+        selected_candidate_count = 0
+
+        chosen_per_item: list[dict[str, Any]] = []
+        chosen_score = {"matched": -1.0, "mean_abs_error": float("inf"), "delta": float("inf")}
+        chosen_dt_sec: float | None = None
+
+        if cache_candidates:
+            window_candidates: list[SnapshotCandidate] = []
+            if ocr_dt_corrected is not None:
+                for candidate in cache_candidates:
+                    if candidate.timestamp > ocr_dt_corrected:
+                        continue
+                    delta = (ocr_dt_corrected - candidate.timestamp).total_seconds()
+                    if delta <= lookback_sec:
+                        window_candidates.append(candidate)
+
+            window_candidates.sort(key=lambda item: (ocr_dt_corrected - item.timestamp).total_seconds() if ocr_dt_corrected else 0.0)
+            if max_candidates > 0:
+                window_candidates = window_candidates[:max_candidates]
+            selected_candidate_count = len(window_candidates)
+
+            for candidate in window_candidates:
+                try:
+                    truth_payload = json.loads(candidate.path.read_text(encoding="utf-8"))
+                    if not isinstance(truth_payload, dict):
+                        raise ValueError("snapshot is not a JSON object")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[WARN] failed to load snapshot {candidate.path}: {exc}")
+                    continue
+
+                truth_map = extract_truth_map(truth_payload)
+                per_item, score, _, _ = evaluate_record(
+                    rec=rec,
+                    truth_map=truth_map,
+                    truth_payload=truth_payload,
+                    ocr_dt_corrected=ocr_dt_corrected,
+                    include_mismatch=False,
+                )
+                candidate_delta = (ocr_dt_corrected - candidate.timestamp).total_seconds() if ocr_dt_corrected else float("inf")
+                if (
+                    score["matched"] > chosen_score["matched"]
+                    or (
+                        score["matched"] == chosen_score["matched"]
+                        and score["mean_abs_error"] < chosen_score["mean_abs_error"]
+                    )
+                    or (
+                        score["matched"] == chosen_score["matched"]
+                        and score["mean_abs_error"] == chosen_score["mean_abs_error"]
+                        and candidate_delta < chosen_score["delta"]
+                    )
+                ):
+                    chosen_per_item = per_item
+                    chosen_score = {
+                        "matched": score["matched"],
+                        "mean_abs_error": score["mean_abs_error"],
+                        "delta": candidate_delta,
+                    }
+                    selected_payload = truth_payload
+                    selected_map = truth_map
+                    selected_snapshot_path = str(candidate.path)
+                    selected_source = "cache_dir_search"
+
+            if selected_snapshot_path is not None:
+                snapshot_used += 1
+
+        if not cache_candidates or selected_snapshot_path is None:
+            snapshot_path = resolve_snapshot_path(rec.get("cache_snapshot_path"), ocr_results_path)
+            if snapshot_path is None:
+                snapshot_missing += 1
+                fallback_used += 1
+            else:
+                try:
+                    selected_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                    if not isinstance(selected_payload, dict):
+                        raise ValueError("snapshot is not a JSON object")
+                    selected_map = extract_truth_map(selected_payload)
+                    selected_snapshot_path = str(snapshot_path)
+                    selected_source = "snapshot"
+                    snapshot_used += 1
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[WARN] failed to load snapshot {snapshot_path}: {exc}")
+                    snapshot_load_error += 1
+                    fallback_used += 1
+                    selected_payload = monitor_cache_payload
+                    selected_map = monitor_truth
+                    selected_snapshot_path = None
+                    selected_source = "monitor_cache_fallback"
+
+        per_item, score, record_mismatches, dt_sec = evaluate_record(
+            rec=rec,
+            truth_map=selected_map,
+            truth_payload=selected_payload,
+            ocr_dt_corrected=ocr_dt_corrected,
+            include_mismatch=True,
+        )
+        chosen_per_item = per_item
+        total += int(score["total"])
+        matched += int(score["matched"])
+        for row in chosen_per_item:
+            if row["parsed_ocr_value"] is None:
+                missing += 1
+                if row["invalid_reason"]:
+                    invalid += 1
+            elif row["abs_error"] is not None:
+                abs_errors.append(row["abs_error"])
+
+        if dt_sec is not None:
+            dt_seconds.append(abs(dt_sec))
+        else:
+            dt_skipped += 1
+
+        mismatches.extend(record_mismatches)
         details.append(
             {
                 "timestamp": rec.get("timestamp"),
                 "validated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "truth_source": snapshot_source,
+                "truth_source": selected_source,
+                "truth_snapshot_used": selected_snapshot_path,
                 "delta_t_seconds": dt_sec,
-                "comparisons": per_item,
+                "candidate_count": selected_candidate_count,
+                "comparisons": chosen_per_item,
             }
         )
 
@@ -372,6 +522,17 @@ def main() -> None:
     parser.add_argument("--monitor-cache", required=True, help="Path to monitor_cache.json")
     parser.add_argument("--validator-config", default="validator_config.json", help="Path to validator config JSON")
     parser.add_argument("--last", type=int, default=50, help="Use latest N OCR records")
+    parser.add_argument("--cache-dir", default=None, help="Directory containing monitor cache snapshots")
+    parser.add_argument("--time-window-sec", type=float, default=10.0, help="Legacy search window in seconds")
+    parser.add_argument("--lookback-sec", type=float, default=12.0, help="Search lookback window in seconds (past only)")
+    parser.add_argument("--max-candidates", type=int, default=40, help="Max candidate snapshots to evaluate per OCR record")
+    parser.add_argument("--lag-sec", type=float, default=0.0, help="Timestamp correction applied to OCR timestamp")
+    parser.add_argument(
+        "--auto-lag",
+        action="store_true",
+        help="Brute-force lag from -10.0 to +10.0 sec (step 0.5) and choose best by score",
+    )
+    parser.add_argument("--select-by", default="score", choices=["score"], help="Candidate selection strategy")
     parser.add_argument(
         "--dump-mismatch",
         type=int,
@@ -399,6 +560,41 @@ def main() -> None:
         raise ValueError(f"monitor_cache file is not a JSON object: {cache_path}")
     monitor_truth = extract_truth_map(monitor_cache_payload)
 
+    cache_candidates: list[SnapshotCandidate] | None = None
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir)
+        cache_candidates = load_snapshot_candidates(cache_dir)
+        print(f"[INFO] cache_candidates_loaded={len(cache_candidates)} from={cache_dir}")
+
+    lookback_sec = args.lookback_sec
+    if args.time_window_sec != 10.0 and args.lookback_sec == 12.0:
+        lookback_sec = args.time_window_sec
+
+    selected_lag = args.lag_sec
+    if args.auto_lag and cache_candidates:
+        lag_values = [x * 0.5 for x in range(-20, 21)]
+        best_lag = selected_lag
+        best_score = (-1.0, float("inf"), float("inf"))
+        for lag in lag_values:
+            _, lag_metrics, _ = validate_records(
+                ocr_records=records,
+                monitor_cache_payload=monitor_cache_payload,
+                monitor_truth=monitor_truth,
+                ocr_results_path=ocr_path,
+                tolerances=tolerances,
+                dump_mismatch=0,
+                cache_candidates=cache_candidates,
+                lookback_sec=lookback_sec,
+                max_candidates=args.max_candidates,
+                lag_sec=lag,
+            )
+            score = (lag_metrics["match_rate"], lag_metrics["mean_abs_error"], lag_metrics["dt_mean_seconds"])
+            if score[0] > best_score[0] or (score[0] == best_score[0] and score[1] < best_score[1]):
+                best_score = score
+                best_lag = lag
+        selected_lag = best_lag
+        print(f"[INFO] auto_lag_selected={selected_lag:.1f}")
+
     rows, metrics, mismatches = validate_records(
         ocr_records=records,
         monitor_cache_payload=monitor_cache_payload,
@@ -406,6 +602,10 @@ def main() -> None:
         ocr_results_path=ocr_path,
         tolerances=tolerances,
         dump_mismatch=args.dump_mismatch,
+        cache_candidates=cache_candidates,
+        lookback_sec=lookback_sec,
+        max_candidates=args.max_candidates,
+        lag_sec=selected_lag,
     )
 
     output_path = ocr_path.parent / "validation_results.jsonl"
