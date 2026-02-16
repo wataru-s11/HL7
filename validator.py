@@ -36,6 +36,8 @@ DEFAULT_VALIDATOR_CONFIG: dict[str, Any] = {
     }
 }
 
+FLOAT_TOLERANCE_VITALS = {"TSKIN", "TRECT"}
+
 
 def safe_float(value: Any) -> float | None:
     if value is None:
@@ -56,6 +58,28 @@ def parse_numeric_with_reason(raw_text: Any, raw_value: Any) -> tuple[float | No
         return None, "empty"
 
     return None, f"invalid_numeric:{text}"
+
+
+def parse_score_fields(raw_fields: str | None) -> set[str] | None:
+    if raw_fields is None:
+        return None
+    parsed = {item.strip() for item in raw_fields.split(",") if item.strip()}
+    return parsed or None
+
+
+def _is_integer_like(value: Any) -> bool:
+    try:
+        return float(value).is_integer()
+    except (TypeError, ValueError):
+        return False
+
+
+def mismatch_tolerance(vital: str, ocr_value: float, truth_value: float) -> float:
+    if vital in FLOAT_TOLERANCE_VITALS:
+        return 0.2
+    if not _is_integer_like(ocr_value) or not _is_integer_like(truth_value):
+        return 0.2
+    return 1.0
 
 
 JST = timezone(timedelta(hours=9))
@@ -276,6 +300,8 @@ def validate_records(
     max_candidates: int,
     lag_sec: float,
     fallback_to_nearest_past: bool,
+    score_fields: set[str] | None,
+    mismatch_details_enabled: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]]]:
     details: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -298,6 +324,7 @@ def validate_records(
     dt_skip_reason_counts: Counter[str] = Counter()
     skip_reason_counts: Counter[str] = Counter()
     snapshot_data_cache: dict[str, SnapshotData] = {}
+    mismatch_details_rows: list[dict[str, Any]] = []
 
     def evaluate_record(
         rec: dict[str, Any],
@@ -337,6 +364,7 @@ def validate_records(
 
             for vital, truth_raw in truth_vitals.items():
                 record_total += 1
+                scoring_enabled = score_fields is None or vital in score_fields
                 truth_value = safe_float(truth_raw)
 
                 ocr_vital_payload = ocr_bed_payload.get(vital, {})
@@ -357,10 +385,25 @@ def validate_records(
                     pass
                 else:
                     abs_error = abs(ocr_value - truth_value)
-                    record_abs_errors.append(abs_error)
-                    is_match = abs_error <= tolerance
-                    if is_match:
-                        record_matched += 1
+                    if scoring_enabled:
+                        record_abs_errors.append(abs_error)
+                        is_match = abs_error <= tolerance
+                        if is_match:
+                            record_matched += 1
+
+                    if mismatch_details_enabled:
+                        detail_tol = mismatch_tolerance(vital, ocr_value, truth_value)
+                        if abs_error > detail_tol:
+                            mismatch_details_rows.append(
+                                {
+                                    "timestamp": rec.get("timestamp"),
+                                    "bed": bed,
+                                    "field": vital,
+                                    "ocr_value": ocr_raw_value,
+                                    "truth_value": truth_raw,
+                                    "abs_error": abs_error,
+                                }
+                            )
 
                 comparison = {
                     "bed": bed,
@@ -554,9 +597,14 @@ def validate_records(
             mismatch_item["truth_snapshot_used"] = selected_snapshot_path
 
         chosen_per_item = per_item
-        total += int(score["total"])
+        if score_fields is None:
+            total += int(score["total"])
+        else:
+            total += sum(1 for row in chosen_per_item if row["vital"] in score_fields)
         matched += int(score["matched"])
         for row in chosen_per_item:
+            if score_fields is not None and row["vital"] not in score_fields:
+                continue
             if row["parsed_ocr_value"] is None:
                 missing += 1
                 if row["invalid_reason"]:
@@ -621,6 +669,11 @@ def validate_records(
     for item in mismatches:
         item.pop("_sort_error", None)
 
+    if mismatch_details_enabled:
+        detail_output_path = ocr_results_path.parent / "mismatch_details.jsonl"
+        write_jsonl(detail_output_path, mismatch_details_rows)
+        print(f"[INFO] mismatch_details_saved={len(mismatch_details_rows)} output={detail_output_path}")
+
     return details, metrics, mismatches
 
 
@@ -669,14 +722,21 @@ def main() -> None:
     parser.add_argument(
         "--dump-mismatch",
         type=int,
+        nargs="?",
+        const=-1,
         default=0,
-        help="Print top-N mismatch rows (bed/vital/value/confidence/path)",
+        help="Enable mismatch details dump JSONL; optional value prints top-N mismatch rows",
     )
     parser.add_argument(
         "--debug-mismatches",
         type=int,
         default=0,
         help="Print top-N mismatching fields with OCR vs truth and selected truth snapshot",
+    )
+    parser.add_argument(
+        "--score-fields",
+        default=None,
+        help="Comma-separated fields used for scoring metrics (e.g. HR,ART_S,ART_D,ART_M,CVP_M,RAP_M,SpO2)",
     )
     args = parser.parse_args()
 
@@ -715,6 +775,16 @@ def main() -> None:
     if args.time_window_sec != 10.0 and args.lookback_sec == 12.0:
         lookback_sec = args.time_window_sec
 
+    score_fields = parse_score_fields(args.score_fields)
+    if score_fields is None:
+        print("[INFO] score_fields=ALL")
+    else:
+        print(f"[INFO] score_fields_selected={sorted(score_fields)}")
+
+    mismatch_details_enabled = args.dump_mismatch != 0
+    if mismatch_details_enabled:
+        print("[INFO] mismatch_detail_logging=enabled")
+
     selected_lag = args.lag_sec
     if args.auto_lag and cache_candidates:
         lag_values = [x * 0.5 for x in range(-20, 21)]
@@ -735,6 +805,8 @@ def main() -> None:
                 max_candidates=args.max_candidates,
                 lag_sec=lag,
                 fallback_to_nearest_past=args.fallback_to_nearest_past,
+                score_fields=score_fields,
+                mismatch_details_enabled=False,
             )
             score = (lag_metrics["match_rate"], lag_metrics["mean_abs_error"], lag_metrics["dt_mean_seconds"])
             if score[0] > best_score[0] or (score[0] == best_score[0] and score[1] < best_score[1]):
@@ -757,6 +829,8 @@ def main() -> None:
         max_candidates=args.max_candidates,
         lag_sec=selected_lag,
         fallback_to_nearest_past=args.fallback_to_nearest_past,
+        score_fields=score_fields,
+        mismatch_details_enabled=mismatch_details_enabled,
     )
 
     output_path = ocr_path.parent / "validation_results.jsonl"
