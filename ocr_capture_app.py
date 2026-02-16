@@ -192,7 +192,7 @@ def find_monitor_window_hwnd(title: str) -> int | None:
     return matches[0] if matches else None
 
 
-def get_window_capture_region(title: str, capture_client: bool) -> CaptureRegion | None:
+def get_window_capture_region(title: str, capture_client: bool = True) -> CaptureRegion | None:
     if not sys.platform.startswith("win"):
         return None
 
@@ -201,31 +201,24 @@ def get_window_capture_region(title: str, capture_client: bool) -> CaptureRegion
     if not hwnd:
         return None
 
-    if capture_client:
-        client_rect = RECT()
-        if not user32.GetClientRect(hwnd, ctypes.byref(client_rect)):
-            return None
+    if not capture_client:
+        print("[WARN] capture_client=false is deprecated. Forcing Win32 client-area capture.", file=sys.stderr)
 
-        left_top = POINT(client_rect.left, client_rect.top)
-        right_bottom = POINT(client_rect.right, client_rect.bottom)
-        if not user32.ClientToScreen(hwnd, ctypes.byref(left_top)):
-            return None
-        if not user32.ClientToScreen(hwnd, ctypes.byref(right_bottom)):
-            return None
+    client_rect = RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(client_rect)):
+        return None
 
-        left = int(left_top.x)
-        top = int(left_top.y)
-        width = int(right_bottom.x - left_top.x)
-        height = int(right_bottom.y - left_top.y)
-    else:
-        window_rect = RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(window_rect)):
-            return None
-        left = int(window_rect.left)
-        top = int(window_rect.top)
-        width = int(window_rect.right - window_rect.left)
-        height = int(window_rect.bottom - window_rect.top)
+    left_top = POINT(client_rect.left, client_rect.top)
+    right_bottom = POINT(client_rect.right, client_rect.bottom)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(left_top)):
+        return None
+    if not user32.ClientToScreen(hwnd, ctypes.byref(right_bottom)):
+        return None
 
+    left = int(left_top.x)
+    top = int(left_top.y)
+    width = int(right_bottom.x - left_top.x)
+    height = int(right_bottom.y - left_top.y)
     if width <= 0 or height <= 0:
         return None
 
@@ -235,6 +228,17 @@ def get_window_capture_region(title: str, capture_client: bool) -> CaptureRegion
 def dpi_aware() -> None:
     if not sys.platform.startswith("win"):
         return
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        context = ctypes.c_void_p(-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ok = user32.SetProcessDpiAwarenessContext(context)
+        if ok:
+            print("[INFO] DPI awareness enabled via SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)")
+            return
+        print("[WARN] SetProcessDpiAwarenessContext() returned FALSE", file=sys.stderr)
+    except Exception as exc:
+        print(f"[WARN] SetProcessDpiAwarenessContext() failed: {exc}", file=sys.stderr)
+
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
         print("[INFO] DPI awareness enabled via SetProcessDpiAwareness(2)")
@@ -645,6 +649,47 @@ def build_exported_rois(
             debug_meta[bed]["cell_boxes"][vital] = (bx1c, by1c, bx2c, by2c)
             debug_meta[bed]["value_rois"][vital] = (rx1, ry1, rx2, ry2)
     return blue_rois, red_rois, debug_meta
+
+
+
+
+def build_rois_for_frame(
+    frame: np.ndarray,
+    config: dict[str, Any],
+    roi_source: str,
+    capture_rect: CaptureRegion,
+) -> tuple[
+    dict[str, dict[str, tuple[int, int, int, int]]],
+    dict[str, dict[str, tuple[int, int, int, int]]],
+    dict[str, dict[str, Any]],
+]:
+    """Build ROI boxes in captured-frame coordinates only."""
+    frame_h, frame_w = frame.shape[:2]
+    if frame_w <= 0 or frame_h <= 0:
+        empty = {bed: {} for bed in BED_IDS}
+        return empty, empty, {bed: {} for bed in BED_IDS}
+
+    if roi_source == "exported":
+        roi_map = load_exported_roi_map(ROI_MAP_PATH)
+        if roi_map is not None:
+            value_slice_cfg = config.get("cell_value_slice") if isinstance(config.get("cell_value_slice"), dict) else {}
+            slice_x1 = float(value_slice_cfg.get("x1_ratio", 0.60))
+            slice_x2 = float(value_slice_cfg.get("x2_ratio", 0.98))
+            slice_y1 = float(value_slice_cfg.get("y1_ratio", 0.10))
+            slice_y2 = float(value_slice_cfg.get("y2_ratio", 0.92))
+            return build_exported_rois(
+                frame=frame,
+                capture_rect=capture_rect,
+                roi_map=roi_map,
+                x1_ratio=slice_x1,
+                x2_ratio=slice_x2,
+                y1_ratio=slice_y1,
+                y2_ratio=slice_y2,
+            )
+        print("[WARN] ROI map not found, fallback to legacy", file=sys.stderr)
+
+    red_rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
+    return red_rois, red_rois, roi_debug
 
 
 def get_monitor_rect(config: dict[str, Any], fallback: CaptureRegion) -> CaptureRegion:
@@ -1491,6 +1536,8 @@ def main() -> None:
 
         mss_monitor_base: CaptureRegion | None = None
         mss_capture_rect: CaptureRegion | None = None
+        mss_fallback_base: CaptureRegion | None = None
+        mss_fallback_rect: CaptureRegion | None = None
         if args.capture_mode == "mss":
             mss_monitor_base = choose_capture_region(
                 sct,
@@ -1522,10 +1569,24 @@ def main() -> None:
                         capture_rect = get_window_capture_region(args.window_title, args.capture_client)
                         if capture_rect is None:
                             print(f"[INFO] window found=not found title='{args.window_title}'")
-                            raise RuntimeError("monitor window not found")
-
-                        print(f"[INFO] window found=found title='{args.window_title}'")
-                        frame = grab_frame(sct, capture_rect)
+                            if mss_fallback_base is None:
+                                mss_fallback_base = choose_capture_region(
+                                    sct,
+                                    args.target_display,
+                                    windows_monitors,
+                                    args.display_index,
+                                    args.mss_monitor_index,
+                                )
+                                mss_fallback_rect = get_monitor_rect(config, mss_fallback_base)
+                            assert mss_fallback_base is not None
+                            assert mss_fallback_rect is not None
+                            capture_rect = mss_fallback_rect
+                            base_frame = grab_frame(sct, mss_fallback_base)
+                            frame = normalize_capture_frame(base_frame, capture_rect, mss_fallback_base)
+                            print("[WARN] using mss fallback capture because Win32 client rect is unavailable", file=sys.stderr)
+                        else:
+                            print(f"[INFO] window found=found title='{args.window_title}'")
+                            frame = grab_frame(sct, capture_rect)
                     else:
                         assert mss_monitor_base is not None
                         assert mss_capture_rect is not None
@@ -1542,35 +1603,15 @@ def main() -> None:
                     )
                     print(f"[INFO] grab image size width={frame.shape[1]} height={frame.shape[0]}")
 
-                    blue_rois: dict[str, dict[str, tuple[int, int, int, int]]]
-                    red_rois: dict[str, dict[str, tuple[int, int, int, int]]]
-                    roi_debug: dict[str, dict[str, Any]]
-                    if args.roi_source == "exported":
-                        roi_map = load_exported_roi_map(ROI_MAP_PATH)
-                        if roi_map is None:
-                            print("[WARN] ROI map not found, fallback to legacy", file=sys.stderr)
-                            red_rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
-                            blue_rois = red_rois
-                        else:
-                            value_slice_cfg = config.get("cell_value_slice") if isinstance(config.get("cell_value_slice"), dict) else {}
-                            slice_x1 = float(value_slice_cfg.get("x1_ratio", 0.60))
-                            slice_x2 = float(value_slice_cfg.get("x2_ratio", 0.98))
-                            slice_y1 = float(value_slice_cfg.get("y1_ratio", 0.10))
-                            slice_y2 = float(value_slice_cfg.get("y2_ratio", 0.92))
-                            blue_rois, red_rois, roi_debug = build_exported_rois(
-                                frame=frame,
-                                capture_rect=capture_rect,
-                                roi_map=roi_map,
-                                x1_ratio=slice_x1,
-                                x2_ratio=slice_x2,
-                                y1_ratio=slice_y1,
-                                y2_ratio=slice_y2,
-                            )
-                    else:
-                        red_rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
-                        blue_rois = red_rois
+                    blue_rois, red_rois, roi_debug = build_rois_for_frame(
+                        frame=frame,
+                        config=config,
+                        roi_source=args.roi_source,
+                        capture_rect=capture_rect,
+                    )
                     rect_map = red_rois
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    roi_tick_dir: Path | None = None
 
                     image_path = None
                     if args.save_images:
@@ -1631,16 +1672,18 @@ def main() -> None:
                                         cx1, cy1, cx2, cy2 = cell
                                         cv2.rectangle(debug_img, (cx1, cy1), (cx2, cy2), (255, 0, 0), 1)
 
-                                    blue = blue_rois.get(bed, {}).get(vital)
-                                    if blue:
-                                        x1, y1, x2, y2 = blue
-                                        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 0, 0), 1)
+                                    if args.debug_lines:
+                                        blue = blue_rois.get(bed, {}).get(vital)
+                                        if blue:
+                                            x1, y1, x2, y2 = blue
+                                            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 0, 0), 1)
                                     red = rect_map.get(bed, {}).get(vital)
                                     if red:
                                         x1, y1, x2, y2 = red
                                         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
                         if args.debug_roi:
-                            roi_crops_dir.mkdir(parents=True, exist_ok=True)
+                            roi_tick_dir = roi_crops_dir / stamp
+                            roi_tick_dir.mkdir(parents=True, exist_ok=True)
 
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for bed in BED_IDS:
@@ -1664,18 +1707,14 @@ def main() -> None:
                             if args.debug_roi:
                                 print(f"[INFO] OCR input roi_final shape bed={bed} vital={vital} shape={roi_crop_final.shape}")
 
-                            text, conf, best_bbox_local, ocr_results = ocr_one_roi(reader, roi_crop_final)
+                            text, conf, best_bbox_local, _ocr_results = ocr_one_roi(reader, roi_crop_final)
                             value = parse_numeric(text, vital, config)
                             beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
 
                             if args.debug_roi:
-                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_raw.png"), roi_crop_raw)
-                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_final.png"), roi_crop_final)
-                                roi_overlay = draw_ocr_bbox_overlay(roi_crop_final, ocr_results)
-                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_overlay.png"), roi_overlay)
-                                print(
-                                    f"[INFO] debug sample bed={bed} vital={vital} roi_final_digits='{text}' OCR text='{text}'",
-                                )
+                                if roi_tick_dir is not None:
+                                    cv2.imwrite(str(roi_tick_dir / f"roi_{bed}_{vital}.png"), roi_crop_raw)
+                                print(f"[INFO] debug sample bed={bed} vital={vital} roi_raw_shape={roi_crop_raw.shape} OCR text='{text}'")
 
                                 if args.debug_full_overlay and full_overlay_img is not None and best_bbox_local:
                                     x1, y1, _x2, _y2 = roi_coords
@@ -1695,7 +1734,7 @@ def main() -> None:
                                         cv2.polylines(full_overlay_img, [bbox_global.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
 
                     if debug_img is not None:
-                        cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
+                        cv2.imwrite(str(debug_dir / f"{stamp}_debug_rois.png"), debug_img)
                     if args.debug_roi and full_overlay_img is not None:
                         cv2.imwrite(str(debug_dir / f"{stamp}_full_overlay.png"), full_overlay_img)
 
