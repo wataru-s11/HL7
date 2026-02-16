@@ -1003,7 +1003,8 @@ def _easyocr_read_numeric(
 
 def ocr_numeric_roi(
     img: np.ndarray,
-    reader: easyocr.Reader,
+    reader_det: easyocr.Reader,
+    reader_rec: easyocr.Reader | None = None,
     field_name: str | None = None,
     prior_value: float | int | None = None,
 ) -> dict[str, Any]:
@@ -1020,21 +1021,23 @@ def ocr_numeric_roi(
     pass_image_map: dict[str, np.ndarray] = {
         "gray": gray,
         "otsu": binarize(gray, invert=False),
+        "otsu_inv": binarize(gray, invert=True),
     }
 
     candidates: list[dict[str, Any]] = []
     raw_easyocr: dict[str, Any] = {}
     chosen_pass = "none"
+    chosen_method = "none"
     preprocessed_image = gray
     attempted_passes: list[str] = []
 
-    def run_pass(pass_name: str) -> None:
-        nonlocal preprocessed_image, chosen_pass
+    def run_pass(pass_name: str, reader: easyocr.Reader, method: str) -> None:
+        nonlocal preprocessed_image, chosen_pass, chosen_method
         pass_img = pass_image_map[pass_name]
         preprocessed_image = pass_img
         attempted_passes.append(pass_name)
         ocr_rows = _easyocr_read_numeric(reader, pass_img, allowlist)
-        raw_easyocr[pass_name] = [{"text": text, "conf": conf} for text, conf in ocr_rows]
+        raw_easyocr[pass_name] = [{"text": text, "conf": conf, "method": method} for text, conf in ocr_rows]
         for raw_text, conf in ocr_rows:
             norm_text = _normalize_ocr_text(raw_text, allowlist)
             if not norm_text or not pattern.match(norm_text):
@@ -1045,22 +1048,43 @@ def ocr_numeric_roi(
                     "text": norm_text,
                     "value": parsed_value,
                     "conf": conf,
-                    "method": "preprocess_multi_pass",
+                    "method": method,
                     "ocr_pass": pass_name,
                 }
             )
         if candidates and chosen_pass == "none":
             chosen_pass = pass_name
+            chosen_method = method
 
     for pass_name in ("gray", "otsu"):
-        run_pass(pass_name)
+        run_pass(pass_name, reader_det, method="preprocess_multi_pass")
         if candidates:
             break
+
+    recognition_fallback_used = False
+    if (
+        not candidates
+        and field in {"CVP_M", "RAP_M"}
+        and _raw_easyocr_all_empty({k: raw_easyocr.get(k, []) for k in ("gray", "otsu")})
+        and reader_rec is not None
+    ):
+        recognition_fallback_used = True
+        for pass_name in ("gray_recognition_only", "otsu_recognition_only"):
+            source_pass = pass_name.replace("_recognition_only", "")
+            pass_image_map[pass_name] = pass_image_map[source_pass]
+            run_pass(pass_name, reader_rec, method="recognition_only")
+            if candidates:
+                break
+
+    if not candidates:
+        run_pass("otsu_inv", reader_det, method="preprocess_multi_pass")
 
     debug_payload = {
         "preprocess_passes": attempted_passes,
         "chosen_pass": chosen_pass,
+        "chosen_method": chosen_method,
         "raw_easyocr": raw_easyocr,
+        "recognition_fallback_used": recognition_fallback_used,
         "boundingRect": tighten_debug.get("boundingRect"),
         "black_pixel_count": tighten_debug.get("black_pixel_count"),
         "tightened": bool(tighten_debug.get("tightened", False)),
@@ -1162,7 +1186,9 @@ def save_failed_roi_artifacts(
         "roi_coords": [int(v) for v in roi_coords],
         "preprocess_passes": debug_meta.get("preprocess_passes", []),
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
+        "chosen_method": debug_meta.get("chosen_method", "none"),
         "raw_easyocr": debug_meta.get("raw_easyocr", {}),
+        "recognition_fallback_used": debug_meta.get("recognition_fallback_used", False),
         "boundingRect": debug_meta.get("boundingRect"),
         "black_pixel_count": debug_meta.get("black_pixel_count"),
         "tightened": debug_meta.get("tightened", False),
@@ -2059,7 +2085,8 @@ def main() -> None:
             )
             return
 
-        reader = easyocr.Reader(["en"], gpu=use_gpu)
+        reader_det = easyocr.Reader(["en"], gpu=use_gpu, detector=True)
+        reader_rec = easyocr.Reader(["en"], gpu=use_gpu, detector=False)
 
         mss_monitor_base: CaptureRegion | None = None
         mss_capture_rect: CaptureRegion | None = None
@@ -2252,13 +2279,58 @@ def main() -> None:
                             if vital in {"CVP_M", "RAP_M"}:
                                 print(f"[INFO] fixed_roi_coords bed={bed} field={vital} coords={roi_coords}")
 
-                            try:
-                                prior_value = last_confirmed_values.get(bed, {}).get(vital)
-                                ocr_result = ocr_numeric_roi(
-                                    roi_crop_raw,
-                                    reader,
-                                    field_name=vital,
-                                    prior_value=prior_value,
+                            prior_value = last_confirmed_values.get(bed, {}).get(vital)
+                            ocr_result = ocr_numeric_roi(
+                                roi_crop_raw,
+                                reader_det,
+                                reader_rec,
+                                field_name=vital,
+                                prior_value=prior_value,
+                            )
+                            text = str(ocr_result.get("text") or "")
+                            value = ocr_result.get("value")
+                            conf_value = safe_float(ocr_result.get("conf"))
+                            conf = conf_value if conf_value is not None else 0.0
+                            method = str(ocr_result.get("method") or "none")
+                            ocr_pass = str(ocr_result.get("ocr_pass") or "none")
+                            imputed = bool(ocr_result.get("imputed", False))
+
+                            beds[bed][vital] = {
+                                "text": text,
+                                "value": value,
+                                "confidence": conf,
+                                "ocr_method": method,
+                                "ocr_conf": conf_value,
+                                "imputed": imputed,
+                                "ocr_pass": ocr_pass,
+                            }
+
+                            if value is not None and not imputed:
+                                last_confirmed_values.setdefault(bed, {})[vital] = value
+
+                            if not text:
+                                missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
+                                bed_debug[vital] = ocr_result.get("debug", {})
+
+                            save_target = fail_roi_fields is None or vital in fail_roi_fields
+                            should_save, save_reason = should_save_failed_roi(ocr_result, text, value)
+                            if (
+                                args.save_fail_roi
+                                and save_target
+                                and should_save
+                                and fail_roi_saved_in_tick < max(int(args.fail_roi_max_per_tick), 0)
+                            ):
+                                saved_files = save_failed_roi_artifacts(
+                                    fail_roi_dir,
+                                    timestamp=stamp,
+                                    bed=bed,
+                                    field=vital,
+                                    roi_coords=roi_coords,
+                                    ocr_result=ocr_result,
+                                )
+                                fail_roi_saved_in_tick += 1
+                                print(
+                                    f"[WARN] ocr_fail_saved bed={bed} field={vital} files={','.join(saved_files)} reason={save_reason}"
                                 )
                                 text = str(ocr_result.get("text") or "")
                                 value = ocr_result.get("value")
