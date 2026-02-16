@@ -48,6 +48,9 @@ CELL_BORDER_MARGIN = 0
 VALUE_TOP_MARGIN = 2
 VALUE_BOTTOM_MARGIN = 3
 VALUE_TARGET_RELY = 0.45
+ROI_MAP_PATH = Path("dataset/layout/monitor_roi_map.json")
+
+
 def dpi_aware() -> None:
     if not sys.platform.startswith("win"):
         return
@@ -248,6 +251,40 @@ class MonitorApp:
         self.root.bind("<Configure>", self.on_configure)
         self.canvas.bind("<Configure>", self.on_resize)
         self.root.after(200, self.redraw_all)
+        self.root.after(400, self.update_roi_map)
+
+    def update_roi_map(self) -> None:
+        try:
+            self.root.update_idletasks()
+            items: dict[str, dict[str, dict[str, int]]] = {}
+            for bed in BED_IDS:
+                bed_items: dict[str, dict[str, int]] = {}
+                for vital in VITAL_ORDER:
+                    widget = self.value_areas.get((bed, vital))
+                    if widget is None:
+                        continue
+                    x = int(widget.winfo_rootx())
+                    y = int(widget.winfo_rooty())
+                    w = int(widget.winfo_width())
+                    h = int(widget.winfo_height())
+                    if w <= 0 or h <= 0:
+                        continue
+                    bed_items[vital] = {"x": x, "y": y, "w": w, "h": h}
+                if bed_items:
+                    items[bed] = bed_items
+
+            payload = {
+                "generated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "window_title": self.root.title() or "HL7 Bed Monitor",
+                "roi_type": "value_widget_bbox_screen",
+                "items": items,
+            }
+            ROI_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            ROI_MAP_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] failed to update ROI map: {exc}", file=sys.stderr)
+        finally:
+            self.root.after(1000, self.update_roi_map)
 
     def apply_initial_window_state(self, fullscreen: bool, geometry: str | None) -> None:
         if geometry:

@@ -58,6 +58,7 @@ VITAL_ORDER = [
 NUMERIC_RE = re.compile(r"^-?\d+(\.\d+)?$")
 ALLOWLIST = "0123456789.-"
 MONITORINFOF_PRIMARY = 0x00000001
+ROI_MAP_PATH = Path("dataset/layout/monitor_roi_map.json")
 
 
 class RECT(ctypes.Structure):
@@ -82,7 +83,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "bottom_pad": 0.12,
     },
     "value_box": {
-        "x1_ratio": 0.58,
+        "x1_ratio": 0.60,
         "x2_ratio": 0.98,
         "y1_ratio": 0.20,
         "y2_ratio": 0.88,
@@ -517,6 +518,93 @@ def write_debug_window_rect_image(path: Path, frame: np.ndarray) -> None:
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(v, hi))
+
+
+def load_exported_roi_map(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("items")
+        if not isinstance(items, dict):
+            return None
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] failed to load ROI map: {exc}", file=sys.stderr)
+        return None
+
+
+def build_exported_rois(
+    frame: np.ndarray,
+    capture_rect: CaptureRegion,
+    roi_map: dict[str, Any],
+    x1_ratio: float,
+    x2_ratio: float,
+    y1_ratio: float,
+    y2_ratio: float,
+) -> tuple[
+    dict[str, dict[str, tuple[int, int, int, int]]],
+    dict[str, dict[str, tuple[int, int, int, int]]],
+    dict[str, dict[str, Any]],
+]:
+    frame_h, frame_w = frame.shape[:2]
+    x1_ratio = min(max(x1_ratio, 0.0), 1.0)
+    x2_ratio = min(max(x2_ratio, 0.0), 1.0)
+    y1_ratio = min(max(y1_ratio, 0.0), 1.0)
+    y2_ratio = min(max(y2_ratio, 0.0), 1.0)
+    sx1, sx2 = min(x1_ratio, x2_ratio), max(x1_ratio, x2_ratio)
+    sy1, sy2 = min(y1_ratio, y2_ratio), max(y1_ratio, y2_ratio)
+
+    items = roi_map.get("items", {}) if isinstance(roi_map, dict) else {}
+    blue_rois: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
+    red_rois: dict[str, dict[str, tuple[int, int, int, int]]] = {bed: {} for bed in BED_IDS}
+    debug_meta: dict[str, dict[str, Any]] = {bed: {"source": "exported", "cell_boxes": {}, "value_rois": {}} for bed in BED_IDS}
+
+    for bed in BED_IDS:
+        bed_items = items.get(bed, {}) if isinstance(items, dict) else {}
+        for vital in VITAL_ORDER:
+            rect = bed_items.get(vital) if isinstance(bed_items, dict) else None
+            if not isinstance(rect, dict):
+                continue
+            try:
+                bx1 = int(rect["x"]) - capture_rect.left
+                by1 = int(rect["y"]) - capture_rect.top
+                bw = int(rect["w"])
+                bh = int(rect["h"])
+            except Exception:
+                continue
+            if bw <= 0 or bh <= 0:
+                continue
+            bx2 = bx1 + bw
+            by2 = by1 + bh
+            if bx2 <= 0 or by2 <= 0 or bx1 >= frame_w or by1 >= frame_h:
+                print(f"[WARN] exported ROI out of frame, skip {bed}.{vital}", file=sys.stderr)
+                continue
+
+            bx1c = clamp(bx1, 0, max(frame_w - 1, 0))
+            by1c = clamp(by1, 0, max(frame_h - 1, 0))
+            bx2c = clamp(bx2, bx1c + 1, frame_w)
+            by2c = clamp(by2, by1c + 1, frame_h)
+
+            bwc = max(bx2c - bx1c, 1)
+            bhc = max(by2c - by1c, 1)
+            rx1 = bx1c + int(bwc * sx1)
+            rx2 = bx1c + int(bwc * sx2)
+            ry1 = by1c + int(bhc * sy1)
+            ry2 = by1c + int(bhc * sy2)
+            rx1 = clamp(rx1, bx1c, bx2c - 1)
+            ry1 = clamp(ry1, by1c, by2c - 1)
+            rx2 = clamp(rx2, rx1 + 1, bx2c)
+            ry2 = clamp(ry2, ry1 + 1, by2c)
+
+            blue_rois[bed][vital] = (bx1c, by1c, bx2c, by2c)
+            red_rois[bed][vital] = (rx1, ry1, rx2, ry2)
+            debug_meta[bed]["cell_boxes"][vital] = (bx1c, by1c, bx2c, by2c)
+            debug_meta[bed]["value_rois"][vital] = (rx1, ry1, rx2, ry2)
+    return blue_rois, red_rois, debug_meta
 
 
 def get_monitor_rect(config: dict[str, Any], fallback: CaptureRegion) -> CaptureRegion:
@@ -1143,6 +1231,7 @@ def main() -> None:
     parser.add_argument("--config", default="ocr_capture_config.json")
     parser.add_argument("--outdir", default="dataset")
     parser.add_argument("--capture-mode", choices=["window", "mss"], default="window")
+    parser.add_argument("--roi-source", choices=["exported", "legacy"], default="exported")
     parser.add_argument("--window-title", default="HL7 Bed Monitor")
     parser.add_argument("--capture-client", type=parse_bool, default=True)
     parser.add_argument("--target-display", choices=["primary", "index", "mss"], default="primary")
@@ -1255,7 +1344,33 @@ def main() -> None:
                     )
                     print(f"[INFO] grab image size width={frame.shape[1]} height={frame.shape[0]}")
 
-                    rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
+                    blue_rois: dict[str, dict[str, tuple[int, int, int, int]]]
+                    red_rois: dict[str, dict[str, tuple[int, int, int, int]]]
+                    roi_debug: dict[str, dict[str, Any]]
+                    if args.roi_source == "exported":
+                        roi_map = load_exported_roi_map(ROI_MAP_PATH)
+                        if roi_map is None:
+                            print("[WARN] ROI map not found, fallback to legacy", file=sys.stderr)
+                            red_rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
+                            blue_rois = red_rois
+                        else:
+                            value_slice_cfg = config.get("cell_value_slice") if isinstance(config.get("cell_value_slice"), dict) else {}
+                            slice_x1 = float(value_slice_cfg.get("x1_ratio", 0.60))
+                            slice_x2 = float(value_slice_cfg.get("x2_ratio", 0.98))
+                            slice_y1 = float(value_slice_cfg.get("y1_ratio", 0.10))
+                            slice_y2 = float(value_slice_cfg.get("y2_ratio", 0.92))
+                            blue_rois, red_rois, roi_debug = build_exported_rois(
+                                frame=frame,
+                                capture_rect=capture_rect,
+                                roi_map=roi_map,
+                                x1_ratio=slice_x1,
+                                x2_ratio=slice_x2,
+                                y1_ratio=slice_y1,
+                                y2_ratio=slice_y2,
+                            )
+                    else:
+                        red_rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
+                        blue_rois = red_rois
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
                     image_path = None
@@ -1289,21 +1404,22 @@ def main() -> None:
                                     cv2.line(debug_img, (bx1, ly), (bx2 - 1, ly), (0, 180, 0), 1)
 
                             if args.debug_roi:
-                                if header_line is not None:
-                                    hy = int(header_line)
-                                    cv2.line(debug_img, (bx1, hy), (bx2 - 1, hy), (0, 255, 0), 2)
+                                if "bed_x1" in meta:
+                                    if header_line is not None:
+                                        hy = int(header_line)
+                                        cv2.line(debug_img, (bx1, hy), (bx2 - 1, hy), (0, 255, 0), 2)
 
-                                cv2.rectangle(debug_img, (bx1, gy1), (bx2 - 1, gy2 - 1), (255, 0, 0), 2)
-                                cv2.putText(
-                                    debug_img,
-                                    f"{bed} grid_top={int(meta.get('grid_top', 0))}",
-                                    (bx1 + 3, max(gy1 - 6, 12)),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.35,
-                                    (255, 255, 0),
-                                    1,
-                                    cv2.LINE_AA,
-                                )
+                                    cv2.rectangle(debug_img, (bx1, gy1), (bx2 - 1, gy2 - 1), (255, 0, 0), 2)
+                                    cv2.putText(
+                                        debug_img,
+                                        f"{bed} grid_top={int(meta.get('grid_top', 0))}",
+                                        (bx1 + 3, max(gy1 - 6, 12)),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.35,
+                                        (255, 255, 0),
+                                        1,
+                                        cv2.LINE_AA,
+                                    )
 
                                 cell_boxes = meta.get("cell_boxes", {})
                                 for vital in VITAL_ORDER:
@@ -1312,14 +1428,24 @@ def main() -> None:
                                         cx1, cy1, cx2, cy2 = cell
                                         cv2.rectangle(debug_img, (cx1, cy1), (cx2, cy2), (255, 0, 0), 1)
 
-                                    x1, y1, x2, y2 = rois[bed][vital]
-                                    cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
+                                    blue = blue_rois.get(bed, {}).get(vital)
+                                    if blue:
+                                        x1, y1, x2, y2 = blue
+                                        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 0, 0), 1)
+                                    red = red_rois.get(bed, {}).get(vital)
+                                    if red:
+                                        x1, y1, x2, y2 = red
+                                        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
                         cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
 
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for bed in BED_IDS:
                         for vital in VITAL_ORDER:
-                            x1, y1, x2, y2 = rois[bed][vital]
+                            roi_box = red_rois.get(bed, {}).get(vital)
+                            if roi_box is None:
+                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
+                                continue
+                            x1, y1, x2, y2 = roi_box
                             roi = frame[y1:y2, x1:x2]
                             text, conf = run_ocr(reader, preprocess_image(roi, config))
                             beds[bed][vital] = {"text": text, "value": parse_value(text), "confidence": conf}
