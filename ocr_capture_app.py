@@ -755,17 +755,13 @@ def parse_numeric(text: str, vital_name: str, config: dict[str, Any]) -> float |
     return None
 
 
-def run_ocr(
-    reader: easyocr.Reader,
-    roi_image: np.ndarray,
-    vital_name: str,
-    config: dict[str, Any],
-) -> tuple[str, float, list[tuple[str, np.ndarray]], list[np.ndarray]]:
+def ocr_one_roi(reader: easyocr.Reader, roi_crop_final: np.ndarray) -> tuple[str, float, list[np.ndarray], list[tuple[np.ndarray, str, float]]]:
+    """Run OCR against the final ROI image only."""
     best_text, best_conf = "", -1.0
     best_bbox_local: list[np.ndarray] = []
 
-    # OCR must run against red ROI crop only (capture-image coordinate conversion is done before this call).
-    results = reader.readtext(roi_image, detail=1, paragraph=False, allowlist=ALLOWLIST)
+    # IMPORTANT: EasyOCR input is always roi_crop_final only.
+    results = reader.readtext(roi_crop_final, detail=1, paragraph=False, allowlist=ALLOWLIST)
     for bbox, text, conf in results:
         filtered = _sanitize_numeric_text(text)
         if not filtered:
@@ -778,14 +774,24 @@ def run_ocr(
             best_text, best_conf = filtered, float(conf)
             best_bbox_local = [bbox_array]
 
-    debug_images: list[tuple[str, np.ndarray]] = [("red", roi_image.copy())]
-    variants = ["normal", "invert", "otsu"] if vital_name in TEMPERATURE_VITALS else ["normal", "otsu"]
-    for variant in variants:
-        debug_images.append((variant, preprocess_roi(roi_image, vital_name, config, variant=variant)))
-
     if best_conf < 0:
-        return "", 0.0, debug_images, []
-    return best_text, best_conf, debug_images, best_bbox_local
+        return "", 0.0, [], []
+    return best_text, best_conf, best_bbox_local, results
+
+
+def draw_ocr_bbox_overlay(roi_crop_final: np.ndarray, ocr_results: list[tuple[np.ndarray, str, float]]) -> np.ndarray:
+    overlay = roi_crop_final.copy()
+    if overlay.ndim == 2:
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+    for bbox, _text, _conf in ocr_results:
+        try:
+            bbox_array = np.asarray(bbox, dtype=np.int32)
+        except Exception:
+            continue
+        if bbox_array.size == 0:
+            continue
+        cv2.polylines(overlay, [bbox_array.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
+    return overlay
 
 
 def crop_red_roi(frame: np.ndarray, roi_box: tuple[int, int, int, int], bed: str, vital: str) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
@@ -1345,7 +1351,8 @@ def run_calibration(
         x1, y1, x2, y2 = rois["BED01"]["RAP_M"]
         ci_x1, ci_y1, ci_x2, ci_y2 = roi_debug["BED01"]["cell_inner_boxes"]["RAP_M"]
         roi_img = cropped[y1:y2, x1:x2]
-        text, conf, _ = run_ocr(reader, roi_img, "RAP_M", config)
+        roi_final = preprocess_roi(roi_img, "RAP_M", config, variant="normal") if roi_img.size > 0 else roi_img
+        text, conf, _best_bbox, _ocr_results = ocr_one_roi(reader, roi_final) if roi_final.size > 0 else ("", 0.0, [], [])
 
         left = cropped.copy()
         cv2.rectangle(left, (ci_x1, ci_y1), (ci_x2, ci_y2), (255, 0, 0), 2)
@@ -1523,6 +1530,7 @@ def main() -> None:
                     else:
                         red_rois, roi_debug = build_vital_rois(frame, config, return_debug=True)
                         blue_rois = red_rois
+                    rect_map = red_rois
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
                     image_path = None
@@ -1585,7 +1593,7 @@ def main() -> None:
                                     if blue:
                                         x1, y1, x2, y2 = blue
                                         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 0, 0), 1)
-                                    red = red_rois.get(bed, {}).get(vital)
+                                    red = rect_map.get(bed, {}).get(vital)
                                     if red:
                                         x1, y1, x2, y2 = red
                                         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 1)
@@ -1595,25 +1603,40 @@ def main() -> None:
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
                     for bed in BED_IDS:
                         for vital in VITAL_ORDER:
-                            roi_box = red_rois.get(bed, {}).get(vital)
+                            roi_box = rect_map.get(bed, {}).get(vital)
                             if roi_box is None:
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
                                 continue
 
-                            roi_crop, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
-                            if roi_crop is None or roi_coords is None:
+                            roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
+                            if roi_crop_raw is None or roi_coords is None:
                                 beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
                                 continue
 
-                            x1, y1, x2, y2 = roi_coords
-                            text, conf, debug_variants, best_bbox_local = run_ocr(reader, roi_crop, vital, config)
+                            roi_crop_final = preprocess_roi(roi_crop_raw, vital, config, variant="normal")
+                            if roi_crop_final.size == 0:
+                                print(f"[WARN] empty final ROI after preprocess, skip {bed}.{vital}", file=sys.stderr)
+                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0}
+                                continue
+
+                            if args.debug_roi:
+                                print(f"[INFO] OCR input roi_final shape bed={bed} vital={vital} shape={roi_crop_final.shape}")
+
+                            text, conf, best_bbox_local, ocr_results = ocr_one_roi(reader, roi_crop_final)
                             value = parse_numeric(text, vital, config)
                             beds[bed][vital] = {"text": text, "value": value, "confidence": conf}
 
                             if args.debug_roi:
-                                cv2.imwrite(str(roi_crops_dir / f"{bed}_{vital}_red.png"), roi_crop)
+                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_crop_raw.png"), roi_crop_raw)
+                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_crop_final.png"), roi_crop_final)
+                                roi_overlay = draw_ocr_bbox_overlay(roi_crop_final, ocr_results)
+                                cv2.imwrite(str(roi_crops_dir / f"{stamp}_{bed}_{vital}_roi_crop_final_bbox.png"), roi_overlay)
+                                print(
+                                    f"[INFO] debug sample bed={bed} vital={vital} roi_final_digits='{text}' OCR text='{text}'",
+                                )
 
                                 if debug_img is not None and best_bbox_local:
+                                    x1, y1, _x2, _y2 = roi_coords
                                     for bbox in best_bbox_local:
                                         if bbox.size == 0:
                                             continue
@@ -1621,10 +1644,6 @@ def main() -> None:
                                         bbox_global[:, 0] += x1
                                         bbox_global[:, 1] += y1
                                         cv2.polylines(debug_img, [bbox_global.reshape(-1, 1, 2)], True, (0, 255, 255), 1)
-
-                                for variant_name, variant_img in debug_variants:
-                                    roi_debug_path = debug_dir / f"{stamp}_roi_{bed}_{vital}_{variant_name}.png"
-                                    cv2.imwrite(str(roi_debug_path), variant_img)
 
                     if debug_img is not None:
                         cv2.imwrite(str(debug_dir / f"{stamp}_rois.png"), debug_img)
