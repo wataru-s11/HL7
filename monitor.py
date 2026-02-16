@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import wintypes
 import json
 import sys
 import time
@@ -49,17 +48,6 @@ CELL_BORDER_MARGIN = 0
 VALUE_TOP_MARGIN = 2
 VALUE_BOTTOM_MARGIN = 3
 VALUE_TARGET_RELY = 0.45
-MONITORINFOF_PRIMARY = 0x00000001
-
-
-class RECT(ctypes.Structure):
-    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
-
-
 def dpi_aware() -> None:
     if not sys.platform.startswith("win"):
         return
@@ -74,66 +62,6 @@ def dpi_aware() -> None:
         print("[INFO] DPI awareness enabled via SetProcessDPIAware()")
     except Exception as exc:
         print(f"[WARN] SetProcessDPIAware() failed: {exc}", file=sys.stderr)
-
-
-def enum_windows_monitors() -> list[dict[str, int | bool]]:
-    if not sys.platform.startswith("win"):
-        print("[WARN] Windows monitor enumeration is only available on Windows", file=sys.stderr)
-        return []
-
-    monitors: list[dict[str, int | bool]] = []
-    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-    monitor_enum_proc = ctypes.WINFUNCTYPE(
-        ctypes.c_int,
-        wintypes.HMONITOR,
-        wintypes.HDC,
-        ctypes.POINTER(RECT),
-        wintypes.LPARAM,
-    )
-
-    def callback(hmonitor, _hdc, _lprc, _lparam):
-        info = MONITORINFO()
-        info.cbSize = ctypes.sizeof(MONITORINFO)
-        ok = user32.GetMonitorInfoW(hmonitor, ctypes.byref(info))
-        if not ok:
-            print(f"[WARN] GetMonitorInfoW failed for hmonitor={hmonitor}", file=sys.stderr)
-            return 1
-
-        left = int(info.rcMonitor.left)
-        top = int(info.rcMonitor.top)
-        width = int(info.rcMonitor.right - info.rcMonitor.left)
-        height = int(info.rcMonitor.bottom - info.rcMonitor.top)
-        is_primary = bool(info.dwFlags & MONITORINFOF_PRIMARY)
-        idx = len(monitors) + 1
-        monitor = {
-            "index": idx,
-            "left": left,
-            "top": top,
-            "width": width,
-            "height": height,
-            "is_primary": is_primary,
-        }
-        monitors.append(monitor)
-        print(
-            "[INFO] monitor "
-            f"index={idx} left={left} top={top} width={width} height={height} is_primary={is_primary}"
-        )
-        return 1
-
-    try:
-        user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(callback), 0)
-    except Exception as exc:
-        print(f"[WARN] EnumDisplayMonitors failed: {exc}", file=sys.stderr)
-        return []
-    return monitors
-
-
-def pick_primary_monitor(monitors: list[dict[str, int | bool]]) -> dict[str, int | bool] | None:
-    for monitor in monitors:
-        if bool(monitor.get("is_primary", False)):
-            return monitor
-    print("[WARN] Primary monitor not found", file=sys.stderr)
-    return monitors[0] if monitors else None
 
 
 def parse_timestamp(ts: str | None) -> datetime | None:
@@ -194,7 +122,14 @@ def shorten_text_for_fit(text: str, allow_decimal_drop: bool = True) -> list[str
 
 
 class MonitorApp:
-    def __init__(self, cache_path: Path, refresh_ms: int = 1000, stale_seconds: int = 30, fullscreen: bool = False):
+    def __init__(
+        self,
+        cache_path: Path,
+        refresh_ms: int = 1000,
+        stale_seconds: int = 30,
+        fullscreen: bool = False,
+        geometry: str | None = None,
+    ):
         self.cache_path = cache_path
         self.refresh_ms = refresh_ms
         self.stale_seconds = stale_seconds
@@ -205,11 +140,10 @@ class MonitorApp:
         self.root = tk.Tk()
         self.root.title("HL7 Bed Monitor")
         self.root.configure(bg="white")
-        self.apply_screen_placement()
+        self.apply_initial_window_state(fullscreen=fullscreen, geometry=geometry)
         self.root.minsize(1280, 760)
         self.fullscreen = fullscreen
-        self.root.attributes("-fullscreen", True)
-        self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
+        self.root.bind("<Escape>", lambda _e: self.root.attributes("-fullscreen", False))
 
         self.title_font = font.Font(family="Consolas", size=20, weight="bold")
         self.label_font = font.Font(family="Consolas", size=16, weight="bold")
@@ -315,22 +249,20 @@ class MonitorApp:
         self.canvas.bind("<Configure>", self.on_resize)
         self.root.after(200, self.redraw_all)
 
-    def apply_screen_placement(self):
-        monitors = enum_windows_monitors()
-        target_monitor = pick_primary_monitor(monitors)
-        if not target_monitor:
-            print("[WARN] Falling back to default Tk geometry", file=sys.stderr)
-            return
+    def apply_initial_window_state(self, fullscreen: bool, geometry: str | None) -> None:
+        if geometry:
+            self.root.geometry(geometry)
+            print(f"[INFO] Applying window geometry={geometry}")
+        else:
+            default_geometry = "1920x1080"
+            self.root.geometry(default_geometry)
+            print(f"[INFO] Applying default window geometry={default_geometry}")
 
-        left = int(target_monitor["left"])
-        top = int(target_monitor["top"])
-        width = int(target_monitor["width"])
-        height = int(target_monitor["height"])
-        print(
-            "[INFO] Launching monitor on primary "
-            f"index={target_monitor['index']} left={left} top={top} width={width} height={height}"
-        )
-        self.root.geometry(f"{width}x{height}+{left}+{top}")
+        if fullscreen:
+            self.root.attributes("-fullscreen", True)
+            print("[INFO] Fullscreen enabled")
+        else:
+            self.root.attributes("-fullscreen", False)
 
 
     def on_escape(self, _event):
@@ -582,10 +514,17 @@ def main() -> None:
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--refresh-ms", type=int, default=1000, help="JSON再読込周期(ms)")
     parser.add_argument("--stale-sec", "--stale-seconds", dest="stale_sec", type=int, default=30, help="更新停止時にNA化する秒数")
-    parser.add_argument("--fullscreen", type=parse_bool, default=False, help="起動時に全画面表示する")
+    parser.add_argument("--fullscreen", type=parse_bool, default=False, help="起動時に全画面表示する (default: false)")
+    parser.add_argument("--geometry", default=None, help='ウィンドウ配置 (例: "1920x1080+100+100")')
     args = parser.parse_args()
 
-    app = MonitorApp(Path(args.cache), refresh_ms=args.refresh_ms, stale_seconds=args.stale_sec, fullscreen=args.fullscreen)
+    app = MonitorApp(
+        Path(args.cache),
+        refresh_ms=args.refresh_ms,
+        stale_seconds=args.stale_sec,
+        fullscreen=args.fullscreen,
+        geometry=args.geometry,
+    )
     app.run()
 
 
