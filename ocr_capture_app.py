@@ -467,7 +467,6 @@ def ensure_config(path: Path) -> dict[str, Any]:
     cell_slice_cfg = dict(DEFAULT_CONFIG.get("cell_value_slice", {}))
     cell_slice_cfg.update(config.get("cell_value_slice", {}) if isinstance(config.get("cell_value_slice"), dict) else {})
     config["cell_value_slice"] = cell_slice_cfg
-    config["roi_strategy"] = str(config.get("roi_strategy", DEFAULT_CONFIG.get("roi_strategy", "cell_inner_slice")))
     config["preprocess"] = pp_cfg
     config.setdefault("per_vital_roi_adjust", {})
     return config
@@ -650,9 +649,6 @@ def build_vital_rois(
     top_pad = float(roi_cfg.get("top_pad", 0.10))
     bottom_pad = float(roi_cfg.get("bottom_pad", 0.12))
 
-    roi_strategy = str(config.get("roi_strategy", "cell_inner_slice")).strip().lower()
-    use_legacy_roi = roi_strategy in {"legacy", "legacy_value_box", "value_box"}
-
     cell_inner_box_cfg = config.get("cell_inner_box") if isinstance(config.get("cell_inner_box"), dict) else {}
     cell_value_slice_cfg = config.get("cell_value_slice") if isinstance(config.get("cell_value_slice"), dict) else {}
     value_box_cfg = config.get("value_box") if isinstance(config.get("value_box"), dict) else None
@@ -662,12 +658,6 @@ def build_vital_rois(
     value_x2_ratio = float(cell_value_slice_cfg.get("x2_ratio", 0.98))
     value_y1_ratio = float(cell_value_slice_cfg.get("y1_ratio", 0.12))
     value_y2_ratio = float(cell_value_slice_cfg.get("y2_ratio", 0.90))
-
-    legacy_value_x1_ratio = float(value_box_cfg.get("x1_ratio", 0.58)) if value_box_cfg is not None else 0.58
-    legacy_value_x2_ratio = float(value_box_cfg.get("x2_ratio", 0.98)) if value_box_cfg is not None else 0.98
-    legacy_value_y1_ratio = float(value_box_cfg.get("y1_ratio", 0.20)) if value_box_cfg is not None else 0.20
-    legacy_value_y2_ratio = float(value_box_cfg.get("y2_ratio", 0.88)) if value_box_cfg is not None else 0.88
-    legacy_value_pad_px = max(int(value_box_cfg.get("pad_px", 2)), 0) if value_box_cfg is not None else 2
 
     adjust_cfg = config.get("per_vital_roi_adjust", {})
 
@@ -719,28 +709,12 @@ def build_vital_rois(
 
             cw, ch = max(cx2 - cx1, 1), max(cy2 - cy1, 1)
 
-            if use_legacy_roi:
+            if value_box_cfg is None and not cell_value_slice_cfg and not cell_inner_box_cfg:
+                vx1 = clamp(cx1 + int(cw * left_ratio), cx1, cx2 - 1)
+                vx2 = clamp(cx2 - int(cw * right_pad), vx1 + 1, cx2)
+                vy1 = clamp(cy1 + int(ch * top_pad), cy1, cy2 - 1)
+                vy2 = clamp(cy2 - int(ch * bottom_pad), vy1 + 1, cy2)
                 cell_x1, cell_y1, cell_x2, cell_y2 = cx1, cy1, cx2, cy2
-                if value_box_cfg is not None:
-                    vx1 = cx1 + int(cw * legacy_value_x1_ratio)
-                    vx2 = cx1 + int(cw * legacy_value_x2_ratio)
-                    vy1 = cy1 + int(ch * legacy_value_y1_ratio)
-                    vy2 = cy1 + int(ch * legacy_value_y2_ratio)
-
-                    vx1 += legacy_value_pad_px
-                    vy1 += legacy_value_pad_px
-                    vx2 -= legacy_value_pad_px
-                    vy2 -= legacy_value_pad_px
-
-                    vx1 = clamp(vx1, cx1, cx2 - 1)
-                    vy1 = clamp(vy1, cy1, cy2 - 1)
-                    vx2 = clamp(vx2, vx1 + 1, cx2)
-                    vy2 = clamp(vy2, vy1 + 1, cy2)
-                else:
-                    vx1 = clamp(cx1 + int(cw * left_ratio), cx1, cx2 - 1)
-                    vx2 = clamp(cx2 - int(cw * right_pad), vx1 + 1, cx2)
-                    vy1 = clamp(cy1 + int(ch * top_pad), cy1, cy2 - 1)
-                    vy2 = clamp(cy2 - int(ch * bottom_pad), vy1 + 1, cy2)
             else:
                 cell_x1 = clamp(cx1 + cell_pad_px, cx1, cx2 - 1)
                 cell_y1 = clamp(cy1 + cell_pad_px, cy1, cy2 - 1)
