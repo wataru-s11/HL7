@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -157,7 +158,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ocr_numeric": {
         "morph_kernel": 2,
     },
-    "debug_save_failed_roi": False,
+    "debug_save_failed_roi": True,
     "vital_ranges": DEFAULT_VITAL_RANGES,
 }
 
@@ -1003,16 +1004,25 @@ def _easyocr_read_numeric(
 
 def ocr_numeric_roi(
     img: np.ndarray,
-    reader_det: easyocr.Reader,
-    reader_rec: easyocr.Reader | None = None,
+    reader: easyocr.Reader,
     field_name: str | None = None,
     prior_value: float | int | None = None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     field = str(field_name or "")
     allowlist = _field_allowlist(field)
     pattern = _field_pattern(field, allowlist)
+    cfg = config if isinstance(config, dict) else DEFAULT_CONFIG
 
-    subimg, tighten_debug = foreground_auto_tighten(img)
+    if field in {"CVP_M", "RAP_M"}:
+        subimg, tighten_debug = foreground_auto_tighten(img)
+    else:
+        subimg = img
+        tighten_debug = {
+            "boundingRect": None,
+            "black_pixel_count": None,
+            "tightened": False,
+        }
     padded = add_padding(subimg, pad=30)
     upscale_scale = 4 if field in {"CVP_M", "RAP_M"} else 3
     upscaled = upscale(padded, scale=upscale_scale)
@@ -1031,7 +1041,7 @@ def ocr_numeric_roi(
     preprocessed_image = gray
     attempted_passes: list[str] = []
 
-    def run_pass(pass_name: str, reader: easyocr.Reader, method: str) -> None:
+    def run_pass(pass_name: str, method: str) -> None:
         nonlocal preprocessed_image, chosen_pass, chosen_method
         pass_img = pass_image_map[pass_name]
         preprocessed_image = pass_img
@@ -1042,7 +1052,7 @@ def ocr_numeric_roi(
             norm_text = _normalize_ocr_text(raw_text, allowlist)
             if not norm_text or not pattern.match(norm_text):
                 continue
-            parsed_value = _parse_value_with_allowlist(norm_text, field, DEFAULT_CONFIG)
+            parsed_value = _parse_value_with_allowlist(norm_text, field, cfg)
             candidates.append(
                 {
                     "text": norm_text,
@@ -1057,34 +1067,18 @@ def ocr_numeric_roi(
             chosen_method = method
 
     for pass_name in ("gray", "otsu"):
-        run_pass(pass_name, reader_det, method="preprocess_multi_pass")
+        run_pass(pass_name, method="preprocess_multi_pass")
         if candidates:
             break
 
-    recognition_fallback_used = False
-    if (
-        not candidates
-        and field in {"CVP_M", "RAP_M"}
-        and _raw_easyocr_all_empty({k: raw_easyocr.get(k, []) for k in ("gray", "otsu")})
-        and reader_rec is not None
-    ):
-        recognition_fallback_used = True
-        for pass_name in ("gray_recognition_only", "otsu_recognition_only"):
-            source_pass = pass_name.replace("_recognition_only", "")
-            pass_image_map[pass_name] = pass_image_map[source_pass]
-            run_pass(pass_name, reader_rec, method="recognition_only")
-            if candidates:
-                break
-
     if not candidates:
-        run_pass("otsu_inv", reader_det, method="preprocess_multi_pass")
+        run_pass("otsu_inv", method="preprocess_multi_pass")
 
     debug_payload = {
-        "preprocess_passes": attempted_passes,
+        "preprocess_passes_tried": attempted_passes,
         "chosen_pass": chosen_pass,
         "chosen_method": chosen_method,
         "raw_easyocr": raw_easyocr,
-        "recognition_fallback_used": recognition_fallback_used,
         "boundingRect": tighten_debug.get("boundingRect"),
         "black_pixel_count": tighten_debug.get("black_pixel_count"),
         "tightened": bool(tighten_debug.get("tightened", False)),
@@ -1141,12 +1135,13 @@ def _raw_easyocr_all_empty(raw_easyocr: Any) -> bool:
 
 
 def should_save_failed_roi(ocr_result: dict[str, Any], text: str, value: Any) -> tuple[bool, str]:
-    debug = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
-    raw_easyocr = debug.get("raw_easyocr")
     if text == "" or value is None:
         return True, "empty_text_or_none_value"
-    if _raw_easyocr_all_empty(raw_easyocr):
-        return True, "all_paths_detect_zero"
+    if str(ocr_result.get("method") or "") == "no_match":
+        return True, "no_match"
+    debug = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
+    if debug.get("exception"):
+        return True, "exception"
     return False, ""
 
 
@@ -1183,12 +1178,12 @@ def save_failed_roi_artifacts(
         "bed": bed,
         "field": field,
         "roi_coords": [int(v) for v in roi_coords],
-        "preprocess_passes": debug_meta.get("preprocess_passes", []),
+        "preprocess_passes_tried": debug_meta.get("preprocess_passes_tried", []),
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
         "chosen_method": debug_meta.get("chosen_method", "none"),
         "raw_easyocr": debug_meta.get("raw_easyocr", {}),
         "exception": debug_meta.get("exception"),
-        "recognition_fallback_used": debug_meta.get("recognition_fallback_used", False),
+        "traceback": debug_meta.get("traceback"),
         "boundingRect": debug_meta.get("boundingRect"),
         "black_pixel_count": debug_meta.get("black_pixel_count"),
         "tightened": debug_meta.get("tightened", False),
@@ -2028,7 +2023,7 @@ def main() -> None:
     parser.add_argument("--debug-full-overlay", type=parse_bool, default=False)
     parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
-    parser.add_argument("--save-fail-roi", type=parse_bool, default=True)
+    parser.add_argument("--save-fail-roi", type=parse_bool, default=None)
     parser.add_argument("--fail-roi-dir", default="day_dir/debug/fail_roi")
     parser.add_argument("--fail-roi-fields", default="CVP_M,RAP_M")
     parser.add_argument("--fail-roi-max-per-tick", type=int, default=20)
@@ -2085,8 +2080,7 @@ def main() -> None:
             )
             return
 
-        reader_det = easyocr.Reader(["en"], gpu=use_gpu, detector=True)
-        reader_rec = easyocr.Reader(["en"], gpu=use_gpu, detector=False)
+        reader = easyocr.Reader(["en"], gpu=use_gpu)
 
         mss_monitor_base: CaptureRegion | None = None
         mss_capture_rect: CaptureRegion | None = None
@@ -2254,8 +2248,12 @@ def main() -> None:
                             roi_debug_input_dir = Path(args.outdir) / "roi_debug" / stamp
                             roi_debug_input_dir.mkdir(parents=True, exist_ok=True)
 
+                    save_fail_roi = bool(config.get("debug_save_failed_roi", True))
+                    if args.save_fail_roi is not None:
+                        save_fail_roi = bool(args.save_fail_roi)
+
                     fail_roi_dir = day_dir / "debug" / "fail_roi" if args.fail_roi_dir == "day_dir/debug/fail_roi" else Path(args.fail_roi_dir)
-                    if args.save_fail_roi:
+                    if save_fail_roi:
                         fail_roi_dir.mkdir(parents=True, exist_ok=True)
                     fail_roi_saved_in_tick = 0
                     beds: dict[str, dict[str, Any]] = {bed: {} for bed in BED_IDS}
@@ -2287,10 +2285,10 @@ def main() -> None:
                                 prior_value = last_confirmed_values.get(bed, {}).get(vital)
                                 ocr_result = ocr_numeric_roi(
                                     roi_crop_raw,
-                                    reader_det,
-                                    reader_rec,
+                                    reader,
                                     field_name=vital,
                                     prior_value=prior_value,
+                                    config=config,
                                 )
                                 text = str(ocr_result.get("text") or "")
                                 value = ocr_result.get("value")
@@ -2320,7 +2318,7 @@ def main() -> None:
                                 save_target = fail_roi_fields is None or vital in fail_roi_fields
                                 should_save, save_reason = should_save_failed_roi(ocr_result, text, value)
                                 if (
-                                    args.save_fail_roi
+                                    save_fail_roi
                                     and save_target
                                     and should_save
                                     and fail_roi_saved_in_tick < max(int(args.fail_roi_max_per_tick), 0)
@@ -2360,7 +2358,7 @@ def main() -> None:
 
                                 save_target = fail_roi_fields is None or vital in fail_roi_fields
                                 if (
-                                    args.save_fail_roi
+                                    save_fail_roi
                                     and save_target
                                     and fail_roi_saved_in_tick < max(int(args.fail_roi_max_per_tick), 0)
                                 ):
@@ -2371,10 +2369,11 @@ def main() -> None:
                                         "method": "field_error",
                                         "ocr_pass": "none",
                                         "debug": {
-                                            "preprocess_passes": [],
+                                            "preprocess_passes_tried": [],
                                             "chosen_pass": "none",
                                             "raw_easyocr": {},
                                             "exception": err_msg,
+                                            "traceback": traceback.format_exc(),
                                         },
                                         "debug_images": {
                                             "raw": roi_crop_raw,
