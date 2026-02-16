@@ -892,7 +892,7 @@ def foreground_auto_tighten(
     img: np.ndarray,
     threshold: int = 200,
     min_black_pixels: int = 12,
-    margin: int = 8,
+    margin: int = 20,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     gray = to_gray(img)
     mask = (gray < threshold).astype(np.uint8)
@@ -1003,7 +1003,8 @@ def _easyocr_read_numeric(
 
 def ocr_numeric_roi(
     img: np.ndarray,
-    reader: easyocr.Reader,
+    reader_det: easyocr.Reader,
+    reader_rec: easyocr.Reader | None = None,
     field_name: str | None = None,
     prior_value: float | int | None = None,
 ) -> dict[str, Any]:
@@ -1016,23 +1017,26 @@ def ocr_numeric_roi(
     upscaled = upscale(padded, scale=3)
     gray = to_gray(upscaled)
 
-    pass_images: list[tuple[str, np.ndarray]] = [("gray", gray)]
-    fallback_passes: list[tuple[str, np.ndarray]] = [
-        ("otsu", binarize(gray, invert=False)),
-        ("otsu_inv", binarize(gray, invert=True)),
-    ]
+    pass_image_map: dict[str, np.ndarray] = {
+        "gray": gray,
+        "otsu": binarize(gray, invert=False),
+        "otsu_inv": binarize(gray, invert=True),
+    }
 
     candidates: list[dict[str, Any]] = []
     raw_easyocr: dict[str, Any] = {}
     chosen_pass = "none"
+    chosen_method = "none"
     preprocessed_image = gray
+    attempted_passes: list[str] = []
 
-    for pass_name, pass_img in pass_images + fallback_passes:
+    def run_pass(pass_name: str, reader: easyocr.Reader, method: str) -> None:
+        nonlocal preprocessed_image, chosen_pass, chosen_method
+        pass_img = pass_image_map[pass_name]
         preprocessed_image = pass_img
-        if pass_name not in [name for name, _ in pass_images]:
-            pass_images.append((pass_name, pass_img))
+        attempted_passes.append(pass_name)
         ocr_rows = _easyocr_read_numeric(reader, pass_img, allowlist)
-        raw_easyocr[pass_name] = [{"text": text, "conf": conf} for text, conf in ocr_rows]
+        raw_easyocr[pass_name] = [{"text": text, "conf": conf, "method": method} for text, conf in ocr_rows]
         for raw_text, conf in ocr_rows:
             norm_text = _normalize_ocr_text(raw_text, allowlist)
             if not norm_text or not pattern.match(norm_text):
@@ -1043,18 +1047,43 @@ def ocr_numeric_roi(
                     "text": norm_text,
                     "value": parsed_value,
                     "conf": conf,
-                    "method": "preprocess_multi_pass",
+                    "method": method,
                     "ocr_pass": pass_name,
                 }
             )
-        if candidates:
+        if candidates and chosen_pass == "none":
             chosen_pass = pass_name
+            chosen_method = method
+
+    for pass_name in ("gray", "otsu"):
+        run_pass(pass_name, reader_det, method="preprocess_multi_pass")
+        if candidates:
             break
 
+    recognition_fallback_used = False
+    if (
+        not candidates
+        and field in {"CVP_M", "RAP_M"}
+        and _raw_easyocr_all_empty({k: raw_easyocr.get(k, []) for k in ("gray", "otsu")})
+        and reader_rec is not None
+    ):
+        recognition_fallback_used = True
+        for pass_name in ("gray_recognition_only", "otsu_recognition_only"):
+            source_pass = pass_name.replace("_recognition_only", "")
+            pass_image_map[pass_name] = pass_image_map[source_pass]
+            run_pass(pass_name, reader_rec, method="recognition_only")
+            if candidates:
+                break
+
+    if not candidates:
+        run_pass("otsu_inv", reader_det, method="preprocess_multi_pass")
+
     debug_payload = {
-        "preprocess_passes": [name for name, _ in pass_images],
+        "preprocess_passes": attempted_passes,
         "chosen_pass": chosen_pass,
+        "chosen_method": chosen_method,
         "raw_easyocr": raw_easyocr,
+        "recognition_fallback_used": recognition_fallback_used,
         "boundingRect": tighten_debug.get("boundingRect"),
         "black_pixel_count": tighten_debug.get("black_pixel_count"),
         "tightened": bool(tighten_debug.get("tightened", False)),
@@ -1156,7 +1185,9 @@ def save_failed_roi_artifacts(
         "roi_coords": [int(v) for v in roi_coords],
         "preprocess_passes": debug_meta.get("preprocess_passes", []),
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
+        "chosen_method": debug_meta.get("chosen_method", "none"),
         "raw_easyocr": debug_meta.get("raw_easyocr", {}),
+        "recognition_fallback_used": debug_meta.get("recognition_fallback_used", False),
         "boundingRect": debug_meta.get("boundingRect"),
         "black_pixel_count": debug_meta.get("black_pixel_count"),
         "tightened": debug_meta.get("tightened", False),
@@ -2053,7 +2084,8 @@ def main() -> None:
             )
             return
 
-        reader = easyocr.Reader(["en"], gpu=use_gpu)
+        reader_det = easyocr.Reader(["en"], gpu=use_gpu, detector=True)
+        reader_rec = easyocr.Reader(["en"], gpu=use_gpu, detector=False)
 
         mss_monitor_base: CaptureRegion | None = None
         mss_capture_rect: CaptureRegion | None = None
@@ -2249,7 +2281,8 @@ def main() -> None:
                             prior_value = last_confirmed_values.get(bed, {}).get(vital)
                             ocr_result = ocr_numeric_roi(
                                 roi_crop_raw,
-                                reader,
+                                reader_det,
+                                reader_rec,
                                 field_name=vital,
                                 prior_value=prior_value,
                             )
