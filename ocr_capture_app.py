@@ -27,10 +27,7 @@ from typing import Any
 from ctypes import wintypes
 
 import cv2
-import easyocr
-import mss
 import numpy as np
-import torch
 
 BED_IDS = [f"BED0{i}" for i in range(1, 7)]
 VITAL_ORDER = [
@@ -1360,6 +1357,8 @@ def run_calibration(
     mss_monitor_index: int | None,
     use_gpu: bool,
 ) -> None:
+    import easyocr
+
     base = choose_capture_region(sct, target_display, windows_monitors, display_index, mss_monitor_index)
     frame = grab_frame(sct, base)
     base_img_h, base_img_w = frame.shape[:2]
@@ -1467,6 +1466,10 @@ def run_calibration(
 
 
 def main() -> None:
+    import easyocr
+    import mss
+    import torch
+
     parser = argparse.ArgumentParser(description="Capture monitor display and OCR all vitals")
     parser.add_argument("--cache", default="monitor_cache.json")
     parser.add_argument("--config", default="ocr_capture_config.json")
