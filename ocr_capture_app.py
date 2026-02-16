@@ -160,6 +160,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "morph_kernel": 2,
     },
     "debug_save_failed_roi": True,
+    "failed_roi_conf_threshold": 0.70,
+    "debug_popup_failed_roi": False,
     "enable_tesseract_fallback": True,
     "tesseract_cmd": "",
     "vital_ranges": DEFAULT_VITAL_RANGES,
@@ -1248,6 +1250,7 @@ def ocr_numeric_roi(
         "raw": img,
         "tight": subimg,
         "pre": preprocessed_image,
+        "passes": pass_image_map,
     }
 
     if final_winner is not None and final_winner.get("value") is not None:
@@ -1292,11 +1295,25 @@ def _raw_easyocr_all_empty(raw_easyocr: Any) -> bool:
     return all(isinstance(rows, list) and len(rows) == 0 for rows in raw_easyocr.values())
 
 
-def should_save_failed_roi(ocr_result: dict[str, Any], text: str, value: Any) -> tuple[bool, str]:
+def should_save_failed_roi(
+    ocr_result: dict[str, Any],
+    text: str,
+    value: Any,
+    *,
+    confidence_threshold: float,
+) -> tuple[bool, str]:
     if text == "" or value is None:
         return True, "empty_text_or_none_value"
-    if str(ocr_result.get("method") or "") == "no_match":
-        return True, "no_match"
+
+    method = str(ocr_result.get("method") or "")
+    if method in {"no_match", "fallback_tesseract"}:
+        return True, method
+
+    conf_value = safe_float(ocr_result.get("conf"))
+    conf = conf_value if conf_value is not None else 0.0
+    if conf < float(confidence_threshold):
+        return True, f"low_confidence_lt_{float(confidence_threshold):.2f}"
+
     debug = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     if debug.get("exception"):
         return True, "exception"
@@ -1305,30 +1322,65 @@ def should_save_failed_roi(ocr_result: dict[str, Any], text: str, value: Any) ->
     return False, ""
 
 
+def _safe_write_image(path: Path, image: np.ndarray) -> bool:
+    try:
+        ok = cv2.imwrite(str(path), image)
+        if not ok:
+            print(f"[WARN] failed to write image path={path}", file=sys.stderr)
+        return bool(ok)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] failed to write image path={path} err={exc}", file=sys.stderr)
+        return False
+
+
+def _show_failed_roi_popup(image: np.ndarray, *, bed: str, field: str) -> None:
+    window_name = f"failed_roi_{bed}_{field}"
+    try:
+        cv2.imshow(window_name, image)
+        cv2.waitKey(500)
+        cv2.destroyWindow(window_name)
+        cv2.waitKey(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] debug popup failed bed={bed} field={field} err={exc}", file=sys.stderr)
+
+
 def save_failed_roi_artifacts(
     fail_roi_dir: Path,
     *,
     timestamp: str,
     bed: str,
     field: str,
+    reason: str,
     roi_coords: tuple[int, int, int, int],
     ocr_result: dict[str, Any],
+    debug_popup_failed_roi: bool,
 ) -> list[str]:
     fail_roi_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{bed}_{field}_{timestamp}"
+    safe_reason = re.sub(r"[^A-Za-z0-9_.-]", "_", reason)
+    prefix = f"{bed}_{field}_{timestamp}_{safe_reason}"
     debug_images = ocr_result.get("debug_images") if isinstance(ocr_result.get("debug_images"), dict) else {}
     debug_meta = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     saved_files: list[str] = []
 
-    paths: dict[str, str | None] = {"raw": None, "pre": None, "meta": None}
-    for suffix in ("raw", "pre"):
-        img = debug_images.get(suffix)
-        if not isinstance(img, np.ndarray) or img.size == 0:
+    paths: dict[str, Any] = {"raw": None, "passes": {}, "meta": None}
+
+    raw_img = debug_images.get("raw")
+    if isinstance(raw_img, np.ndarray) and raw_img.size > 0:
+        raw_path = fail_roi_dir / f"{prefix}_raw.png"
+        if _safe_write_image(raw_path, raw_img):
+            paths["raw"] = raw_path.as_posix()
+            saved_files.append(raw_path.name)
+        if debug_popup_failed_roi:
+            _show_failed_roi_popup(raw_img, bed=bed, field=field)
+
+    pass_images = debug_images.get("passes") if isinstance(debug_images.get("passes"), dict) else {}
+    for pass_name, pass_img in pass_images.items():
+        if not isinstance(pass_img, np.ndarray) or pass_img.size == 0:
             continue
-        out_path = fail_roi_dir / f"{prefix}_{suffix}.png"
-        cv2.imwrite(str(out_path), img)
-        paths[suffix] = out_path.as_posix()
-        saved_files.append(out_path.name)
+        pass_path = fail_roi_dir / f"{prefix}_{pass_name}.png"
+        if _safe_write_image(pass_path, pass_img):
+            paths["passes"][pass_name] = pass_path.as_posix()
+            saved_files.append(pass_path.name)
 
     meta_path = fail_roi_dir / f"{prefix}_meta.json"
     paths["meta"] = meta_path.as_posix()
@@ -1337,7 +1389,15 @@ def save_failed_roi_artifacts(
         "timestamp": timestamp,
         "bed": bed,
         "field": field,
+        "reason": safe_reason,
         "roi_coords": [int(v) for v in roi_coords],
+        "result": {
+            "text": ocr_result.get("text", ""),
+            "value": ocr_result.get("value"),
+            "conf": ocr_result.get("conf"),
+            "ocr_method": ocr_result.get("method", "none"),
+            "ocr_pass": ocr_result.get("ocr_pass", "none"),
+        },
         "preprocess_passes_tried": debug_meta.get("preprocess_passes_tried", []),
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
         "chosen_method": debug_meta.get("chosen_method", "none"),
@@ -1357,8 +1417,11 @@ def save_failed_roi_artifacts(
         "tesseract_exception": debug_meta.get("tesseract_exception"),
         "paths": paths,
     }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    saved_files.append(meta_path.name)
+    try:
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        saved_files.append(meta_path.name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] failed to write metadata path={meta_path} err={exc}", file=sys.stderr)
     return saved_files
 
 def _sanitize_numeric_text(text: str) -> str:
@@ -2190,7 +2253,7 @@ def main() -> None:
     parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
     parser.add_argument("--save-fail-roi", type=parse_bool, default=None)
-    parser.add_argument("--fail-roi-dir", default="day_dir/debug/fail_roi")
+    parser.add_argument("--fail-roi-dir", default="day_dir/failed_rois")
     parser.add_argument("--fail-roi-fields", default="CVP_M,RAP_M")
     parser.add_argument("--fail-roi-max-per-tick", type=int, default=20)
     parser.add_argument("--tesseract-fallback", type=parse_bool, default=None)
@@ -2422,9 +2485,13 @@ def main() -> None:
 
                     save_fail_roi = bool(config.get("debug_save_failed_roi", True))
                     if args.save_fail_roi is not None:
-                        save_fail_roi = bool(args.save_fail_roi)
+                        save_fail_roi = save_fail_roi and bool(args.save_fail_roi)
 
-                    fail_roi_dir = day_dir / "debug" / "fail_roi" if args.fail_roi_dir == "day_dir/debug/fail_roi" else Path(args.fail_roi_dir)
+                    fail_roi_conf_threshold = safe_float(config.get("failed_roi_conf_threshold"))
+                    if fail_roi_conf_threshold is None:
+                        fail_roi_conf_threshold = 0.70
+                    debug_popup_failed_roi = bool(config.get("debug_popup_failed_roi", False))
+                    fail_roi_dir = day_dir / "failed_rois" if args.fail_roi_dir == "day_dir/failed_rois" else Path(args.fail_roi_dir)
                     if save_fail_roi:
                         fail_roi_dir.mkdir(parents=True, exist_ok=True)
                     fail_roi_saved_in_tick = 0
@@ -2488,7 +2555,12 @@ def main() -> None:
                                     bed_debug[vital] = ocr_result.get("debug", {})
 
                                 save_target = fail_roi_fields is None or vital in fail_roi_fields
-                                should_save, save_reason = should_save_failed_roi(ocr_result, text, value)
+                                should_save, save_reason = should_save_failed_roi(
+                                    ocr_result,
+                                    text,
+                                    value,
+                                    confidence_threshold=fail_roi_conf_threshold,
+                                )
                                 if (
                                     save_fail_roi
                                     and save_target
@@ -2500,8 +2572,10 @@ def main() -> None:
                                         timestamp=stamp,
                                         bed=bed,
                                         field=vital,
+                                        reason=save_reason,
                                         roi_coords=roi_coords,
                                         ocr_result=ocr_result,
+                                        debug_popup_failed_roi=debug_popup_failed_roi,
                                     )
                                     fail_roi_saved_in_tick += 1
                                     print(
@@ -2550,6 +2624,7 @@ def main() -> None:
                                         "debug_images": {
                                             "raw": roi_crop_raw,
                                             "pre": roi_crop_raw,
+                                            "passes": {"error": roi_crop_raw},
                                         },
                                     }
                                     saved_files = save_failed_roi_artifacts(
@@ -2557,8 +2632,10 @@ def main() -> None:
                                         timestamp=stamp,
                                         bed=bed,
                                         field=vital,
+                                        reason="exception",
                                         roi_coords=roi_coords if roi_coords is not None else (0, 0, 0, 0),
                                         ocr_result=ocr_result_err,
+                                        debug_popup_failed_roi=debug_popup_failed_roi,
                                     )
                                     fail_roi_saved_in_tick += 1
                                     print(
