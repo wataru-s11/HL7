@@ -15,6 +15,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import font
 
+from screeninfo import get_monitors
+
 
 BED_IDS = [f"BED0{i}" for i in range(1, 7)]
 VITAL_ORDER = [
@@ -118,11 +120,11 @@ class MonitorApp:
         self.root = tk.Tk()
         self.root.title("HL7 Bed Monitor")
         self.root.configure(bg="white")
-        self.root.geometry("1920x1080")
+        self.apply_screen_placement()
         self.root.minsize(1280, 760)
         self.fullscreen = fullscreen
-        self.root.attributes("-fullscreen", self.fullscreen)
-        self.root.bind("<Escape>", self.on_escape)
+        self.root.attributes("-fullscreen", True)
+        self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
 
         self.title_font = font.Font(family="Consolas", size=20, weight="bold")
         self.label_font = font.Font(family="Consolas", size=16, weight="bold")
@@ -227,6 +229,22 @@ class MonitorApp:
         self.root.bind("<Configure>", self.on_configure)
         self.canvas.bind("<Configure>", self.on_resize)
         self.root.after(200, self.redraw_all)
+
+    def apply_screen_placement(self):
+        monitors = get_monitors()
+        idx = 1 if len(monitors) > 1 else 0
+        target_monitor = monitors[idx]
+
+        print(
+            f"[INFO] Launching monitor on monitor index={idx} "
+            f"({target_monitor.width}x{target_monitor.height} at "
+            f"{target_monitor.x},{target_monitor.y})"
+        )
+
+        self.root.geometry(
+            f"{target_monitor.width}x{target_monitor.height}"
+            f"+{target_monitor.x}+{target_monitor.y}"
+        )
 
 
     def on_escape(self, _event):
