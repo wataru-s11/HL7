@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import importlib
 import unicodedata
 import re
 import shutil
@@ -159,8 +160,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "morph_kernel": 2,
     },
     "debug_save_failed_roi": True,
+    "enable_tesseract_fallback": True,
+    "tesseract_cmd": "",
     "vital_ranges": DEFAULT_VITAL_RANGES,
 }
+
+
+_TESSERACT_WARNED = False
 
 
 @dataclass
@@ -1002,6 +1008,98 @@ def _easyocr_read_numeric(
     return parsed
 
 
+def _get_pytesseract(config: dict[str, Any]) -> Any | None:
+    global _TESSERACT_WARNED
+    try:
+        pytesseract = importlib.import_module("pytesseract")
+    except Exception:
+        if not _TESSERACT_WARNED:
+            print("[WARN] pytesseract is unavailable. Tesseract fallback is disabled.", file=sys.stderr)
+            _TESSERACT_WARNED = True
+        return None
+
+    tesseract_cmd = str(config.get("tesseract_cmd", "") or "").strip()
+    if tesseract_cmd:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        except Exception as exc:  # noqa: BLE001
+            if not _TESSERACT_WARNED:
+                print(f"[WARN] failed to set tesseract_cmd='{tesseract_cmd}': {exc}", file=sys.stderr)
+                _TESSERACT_WARNED = True
+    return pytesseract
+
+
+def _normalize_tesseract_text(text: str, allowlist: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = normalized.strip().replace(" ", "").replace("\n", "")
+    filtered = "".join(ch for ch in normalized if ch in allowlist)
+    if not filtered and "O" in normalized and "0" in allowlist:
+        maybe = normalized.replace("O", "0").replace("o", "0")
+        filtered = "".join(ch for ch in maybe if ch in allowlist)
+    return _normalize_ocr_text(filtered, allowlist)
+
+
+def _tesseract_read_numeric(
+    image: np.ndarray,
+    *,
+    allowlist: str,
+    pattern: re.Pattern[str],
+    field_name: str,
+    prior_value: float | int | None,
+    config: dict[str, Any],
+    tighten_debug: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    global _TESSERACT_WARNED
+    pytesseract = _get_pytesseract(config)
+    debug: dict[str, Any] = {
+        "tesseract_used": False,
+        "tesseract_text": "",
+        "tesseract_raw": "",
+        "tesseract_config": None,
+        "tesseract_exception": None,
+    }
+    if pytesseract is None:
+        return None, debug
+
+    h, w = image.shape[:2]
+    small_roi = h <= 80 or w <= 80
+    bbox = tighten_debug.get("boundingRect") if isinstance(tighten_debug, dict) else None
+    if isinstance(bbox, dict):
+        small_roi = small_roi or int(bbox.get("w", 0)) <= 35
+    psm = 10 if small_roi else 7
+    tess_cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789.-"
+    debug["tesseract_used"] = True
+    debug["tesseract_config"] = tess_cfg
+
+    try:
+        raw_text = str(pytesseract.image_to_string(image, config=tess_cfg))
+        debug["tesseract_raw"] = raw_text
+        norm_text = _normalize_tesseract_text(raw_text, allowlist)
+        debug["tesseract_text"] = norm_text
+        if not norm_text or pattern.match(norm_text) is None:
+            return None, debug
+        value = _parse_value_with_allowlist(norm_text, field_name, config)
+        if value is None:
+            return None, debug
+        score = _score_candidate(norm_text, 1.0, True, value, prior_value)
+        result = {
+            "text": norm_text,
+            "value": value,
+            "conf": None,
+            "method": "fallback_tesseract",
+            "ocr_pass": "tesseract",
+            "imputed": False,
+            "score": score,
+        }
+        return result, debug
+    except Exception as exc:  # noqa: BLE001
+        debug["tesseract_exception"] = str(exc)
+        if not _TESSERACT_WARNED:
+            print(f"[WARN] Tesseract fallback failed: {exc}", file=sys.stderr)
+            _TESSERACT_WARNED = True
+        return None, debug
+
+
 def ocr_numeric_roi(
     img: np.ndarray,
     reader: easyocr.Reader,
@@ -1023,6 +1121,7 @@ def ocr_numeric_roi(
             "black_pixel_count": None,
             "tightened": False,
         }
+
     padded = add_padding(subimg, pad=30)
     upscale_scale = 4 if field in {"CVP_M", "RAP_M"} else 3
     upscaled = upscale(padded, scale=upscale_scale)
@@ -1040,19 +1139,37 @@ def ocr_numeric_roi(
     chosen_method = "none"
     preprocessed_image = gray
     attempted_passes: list[str] = []
+    pass_errors: dict[str, Any] = {}
+    tesseract_debug: dict[str, Any] = {
+        "tesseract_used": False,
+        "tesseract_text": "",
+        "tesseract_raw": "",
+        "tesseract_config": None,
+        "tesseract_exception": None,
+    }
 
     def run_pass(pass_name: str, method: str) -> None:
         nonlocal preprocessed_image, chosen_pass, chosen_method
         pass_img = pass_image_map[pass_name]
         preprocessed_image = pass_img
         attempted_passes.append(pass_name)
-        ocr_rows = _easyocr_read_numeric(reader, pass_img, allowlist)
+        try:
+            ocr_rows = _easyocr_read_numeric(reader, pass_img, allowlist)
+        except Exception as exc:  # noqa: BLE001
+            pass_errors[pass_name] = {
+                "exception": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            raw_easyocr[pass_name] = []
+            return
+
         raw_easyocr[pass_name] = [{"text": text, "conf": conf, "method": method} for text, conf in ocr_rows]
         for raw_text, conf in ocr_rows:
             norm_text = _normalize_ocr_text(raw_text, allowlist)
             if not norm_text or not pattern.match(norm_text):
                 continue
             parsed_value = _parse_value_with_allowlist(norm_text, field, cfg)
+            score = _score_candidate(norm_text, conf, True, parsed_value, prior_value)
             candidates.append(
                 {
                     "text": norm_text,
@@ -1060,6 +1177,7 @@ def ocr_numeric_roi(
                     "conf": conf,
                     "method": method,
                     "ocr_pass": pass_name,
+                    "score": score,
                 }
             )
         if candidates and chosen_pass == "none":
@@ -1074,16 +1192,57 @@ def ocr_numeric_roi(
     if not candidates:
         run_pass("otsu_inv", method="preprocess_multi_pass")
 
+    easyocr_winner = max(candidates, key=lambda c: c.get("score", -1.0)) if candidates else None
+    easyocr_failed = (
+        easyocr_winner is None
+        or str(easyocr_winner.get("text") or "") == ""
+        or easyocr_winner.get("value") is None
+        or bool(pass_errors)
+        or _raw_easyocr_all_empty(raw_easyocr)
+    )
+
+    enable_tesseract = bool(cfg.get("enable_tesseract_fallback", True))
+    final_winner = easyocr_winner
+    if enable_tesseract and easyocr_failed:
+        tesseract_result, t_debug = _tesseract_read_numeric(
+            preprocessed_image,
+            allowlist=allowlist,
+            pattern=pattern,
+            field_name=field,
+            prior_value=prior_value,
+            config=cfg,
+            tighten_debug=tighten_debug,
+        )
+        tesseract_debug.update(t_debug)
+        if tesseract_result is not None:
+            final_winner = tesseract_result
+            chosen_pass = "tesseract"
+            chosen_method = "fallback_tesseract"
+
+    ocr_exception = None
+    ocr_traceback = None
+    if pass_errors:
+        ocr_exception = "; ".join(f"{k}: {v.get('exception')}" for k, v in pass_errors.items())
+        ocr_traceback = "\n\n".join(str(v.get("traceback", "")) for v in pass_errors.values())
+
     debug_payload = {
         "preprocess_passes_tried": attempted_passes,
         "chosen_pass": chosen_pass,
         "chosen_method": chosen_method,
         "raw_easyocr": raw_easyocr,
+        "pass_errors": pass_errors,
         "boundingRect": tighten_debug.get("boundingRect"),
         "black_pixel_count": tighten_debug.get("black_pixel_count"),
         "tightened": bool(tighten_debug.get("tightened", False)),
         "allowlist": allowlist,
         "regex": pattern.pattern,
+        "exception": ocr_exception,
+        "traceback": ocr_traceback,
+        "tesseract_used": bool(tesseract_debug.get("tesseract_used", False)),
+        "tesseract_text": tesseract_debug.get("tesseract_text", ""),
+        "tesseract_raw": tesseract_debug.get("tesseract_raw", ""),
+        "tesseract_config": tesseract_debug.get("tesseract_config"),
+        "tesseract_exception": tesseract_debug.get("tesseract_exception"),
     }
     debug_images = {
         "raw": img,
@@ -1091,14 +1250,13 @@ def ocr_numeric_roi(
         "pre": preprocessed_image,
     }
 
-    if candidates:
-        winner = max(candidates, key=lambda c: -1.0 if c["conf"] is None else c["conf"])
+    if final_winner is not None and final_winner.get("value") is not None:
         return {
-            "text": winner["text"],
-            "value": winner["value"],
-            "conf": winner["conf"],
-            "method": winner["method"],
-            "ocr_pass": winner["ocr_pass"],
+            "text": final_winner["text"],
+            "value": final_winner["value"],
+            "conf": final_winner["conf"],
+            "method": final_winner["method"],
+            "ocr_pass": final_winner["ocr_pass"],
             "imputed": False,
             "debug": debug_payload,
             "debug_images": debug_images,
@@ -1142,6 +1300,8 @@ def should_save_failed_roi(ocr_result: dict[str, Any], text: str, value: Any) ->
     debug = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     if debug.get("exception"):
         return True, "exception"
+    if _raw_easyocr_all_empty(debug.get("raw_easyocr")):
+        return True, "easyocr_detection_empty"
     return False, ""
 
 
@@ -1182,6 +1342,7 @@ def save_failed_roi_artifacts(
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
         "chosen_method": debug_meta.get("chosen_method", "none"),
         "raw_easyocr": debug_meta.get("raw_easyocr", {}),
+        "pass_errors": debug_meta.get("pass_errors", {}),
         "exception": debug_meta.get("exception"),
         "traceback": debug_meta.get("traceback"),
         "boundingRect": debug_meta.get("boundingRect"),
@@ -1189,6 +1350,11 @@ def save_failed_roi_artifacts(
         "tightened": debug_meta.get("tightened", False),
         "allowlist": debug_meta.get("allowlist"),
         "regex": debug_meta.get("regex"),
+        "tesseract_used": debug_meta.get("tesseract_used", False),
+        "tesseract_text": debug_meta.get("tesseract_text", ""),
+        "tesseract_raw": debug_meta.get("tesseract_raw", ""),
+        "tesseract_config": debug_meta.get("tesseract_config"),
+        "tesseract_exception": debug_meta.get("tesseract_exception"),
         "paths": paths,
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2027,6 +2193,8 @@ def main() -> None:
     parser.add_argument("--fail-roi-dir", default="day_dir/debug/fail_roi")
     parser.add_argument("--fail-roi-fields", default="CVP_M,RAP_M")
     parser.add_argument("--fail-roi-max-per-tick", type=int, default=20)
+    parser.add_argument("--tesseract-fallback", type=parse_bool, default=None)
+    parser.add_argument("--tesseract-cmd", default="")
     parser.add_argument("--gpu", type=parse_bool, default=True)
     parser.add_argument("--no-launch-monitor", type=parse_bool, default=True)  # MOD: 安全側デフォルト
     parser.add_argument("--run-validator", type=parse_bool, default=False)  # MOD
@@ -2046,6 +2214,10 @@ def main() -> None:
     config_path = Path(args.config)
     config = ensure_config(config_path)
     config["window_title"] = args.window_title
+    if args.tesseract_fallback is not None:
+        config["enable_tesseract_fallback"] = bool(args.tesseract_fallback)
+    if str(args.tesseract_cmd or "").strip():
+        config["tesseract_cmd"] = str(args.tesseract_cmd).strip()
     cache_path = Path(args.cache)
     validator_config = Path(args.validator_config)
 
