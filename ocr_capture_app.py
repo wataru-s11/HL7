@@ -27,6 +27,7 @@ import cv2
 import easyocr
 import mss
 import numpy as np
+import torch
 
 try:
     import pygetwindow as gw
@@ -271,7 +272,7 @@ def copy_cache_snapshot(cache_path: Path, day_dir: Path, stamp: str) -> str | No
     return None
 
 
-def run_calibration(sct: mss.mss, config_path: Path, config: dict[str, Any], monitor_index: int) -> None:
+def run_calibration(sct: mss.mss, config_path: Path, config: dict[str, Any], monitor_index: int, use_gpu: bool) -> None:
     base = choose_capture_region(sct, config, monitor_index)
     frame = grab_frame(sct, base)
 
@@ -284,7 +285,7 @@ def run_calibration(sct: mss.mss, config_path: Path, config: dict[str, Any], mon
     config["monitor_index"] = monitor_index
     config["monitor_rect"] = {"left": base.left + x, "top": base.top + y, "width": w, "height": h}
     cropped = frame[y : y + h, x : x + w].copy()
-    reader = easyocr.Reader(["en"], gpu=False)
+    reader = easyocr.Reader(["en"], gpu=use_gpu)
 
     win = "Calibration (s=save, q=quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -347,19 +348,27 @@ def main() -> None:
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
+    parser.add_argument("--gpu", type=parse_bool, default=True)
     parser.add_argument("--calibrate", action="store_true")
     args = parser.parse_args()
 
     config_path = Path(args.config)
     config = ensure_config(config_path)
     cache_path = Path(args.cache)
-    reader = easyocr.Reader(["en"], gpu=False)
+    cuda_available = torch.cuda.is_available()
+    print(f"[INFO] torch.cuda.is_available()={cuda_available}")
+    use_gpu = args.gpu
+    if use_gpu and not cuda_available:
+        print("[WARN] GPU requested but CUDA is unavailable. Falling back to gpu=False.")
+        use_gpu = False
 
     with mss.mss() as sct:
         log_monitors(sct)
         if args.calibrate:
-            run_calibration(sct, config_path, config, args.monitor_index)
+            run_calibration(sct, config_path, config, args.monitor_index, use_gpu)
             return
+
+        reader = easyocr.Reader(["en"], gpu=use_gpu)
 
         monitor_base = choose_capture_region(sct, config, args.monitor_index)
         capture_rect = get_monitor_rect(config, monitor_base)
