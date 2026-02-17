@@ -1063,37 +1063,41 @@ def _tesseract_read_numeric(
     if pytesseract is None:
         return None, debug
 
-    h, w = image.shape[:2]
-    small_roi = h <= 80 or w <= 80
-    bbox = tighten_debug.get("boundingRect") if isinstance(tighten_debug, dict) else None
-    if isinstance(bbox, dict):
-        small_roi = small_roi or int(bbox.get("w", 0)) <= 35
-    psm = 10 if small_roi else 7
-    tess_cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=0123456789.-"
+    whitelist = "".join(ch for ch in allowlist if ch in "0123456789.-") or "0123456789."
+    psm_candidates = [7, 8]
+    tess_cfg = ""
     debug["tesseract_used"] = True
-    debug["tesseract_config"] = tess_cfg
+    debug["psm_candidates"] = psm_candidates
+    debug["whitelist"] = whitelist
 
     try:
-        raw_text = str(pytesseract.image_to_string(image, config=tess_cfg))
-        debug["tesseract_raw"] = raw_text
-        norm_text = _normalize_tesseract_text(raw_text, allowlist)
-        debug["tesseract_text"] = norm_text
-        if not norm_text or pattern.match(norm_text) is None:
-            return None, debug
-        value = _parse_value_with_allowlist(norm_text, field_name, config)
-        if value is None:
-            return None, debug
-        score = _score_candidate(norm_text, 1.0, True, value, prior_value)
-        result = {
-            "text": norm_text,
-            "value": value,
-            "conf": None,
-            "method": "fallback_tesseract",
-            "ocr_pass": "tesseract",
-            "imputed": False,
-            "score": score,
-        }
-        return result, debug
+        for psm in psm_candidates:
+            tess_cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist={whitelist}"
+            debug["tesseract_config"] = tess_cfg
+            raw_text = str(pytesseract.image_to_string(image, config=tess_cfg))
+            debug["tesseract_raw"] = raw_text
+            norm_text = _normalize_tesseract_text(raw_text, allowlist)
+            debug["tesseract_text"] = norm_text
+            if not norm_text or pattern.match(norm_text) is None:
+                continue
+            value = _parse_value_with_allowlist(norm_text, field_name, config)
+            if value is None:
+                continue
+            score = _score_candidate(norm_text, 1.0, True, value, prior_value)
+            result = {
+                "text": norm_text,
+                "value": value,
+                "conf": None,
+                "method": "fallback_tesseract",
+                "ocr_pass": "tesseract",
+                "imputed": False,
+                "score": score,
+                "psm": psm,
+                "oem": 1,
+                "whitelist": whitelist,
+            }
+            return result, debug
+        return None, debug
     except Exception as exc:  # noqa: BLE001
         debug["tesseract_exception"] = str(exc)
         if not _TESSERACT_WARNED:
@@ -1108,6 +1112,9 @@ def ocr_numeric_roi(
     field_name: str | None = None,
     prior_value: float | int | None = None,
     config: dict[str, Any] | None = None,
+    ocr_engine: str = "easyocr",
+    run_tesseract_for_field: bool = False,
+    low_conf_threshold: float = 0.5,
 ) -> dict[str, Any]:
     field = str(field_name or "")
     allowlist = _field_allowlist(field)
@@ -1204,8 +1211,22 @@ def ocr_numeric_roi(
     )
 
     enable_tesseract = bool(cfg.get("enable_tesseract_fallback", True))
+    selected_engine = "easyocr"
+    easyocr_conf = safe_float(easyocr_winner.get("conf")) if easyocr_winner else None
+    easyocr_low_conf = easyocr_conf is None or easyocr_conf < float(low_conf_threshold)
+    easyocr_unusable = easyocr_failed or easyocr_low_conf
+
+    should_run_tesseract = False
+    if ocr_engine == "tesseract":
+        should_run_tesseract = True
+    elif ocr_engine == "both":
+        should_run_tesseract = run_tesseract_for_field
+    elif ocr_engine == "easyocr" and enable_tesseract and easyocr_unusable:
+        should_run_tesseract = True
+
     final_winner = easyocr_winner
-    if enable_tesseract and easyocr_failed:
+    tesseract_result = None
+    if should_run_tesseract:
         tesseract_result, t_debug = _tesseract_read_numeric(
             preprocessed_image,
             allowlist=allowlist,
@@ -1216,10 +1237,26 @@ def ocr_numeric_roi(
             tighten_debug=tighten_debug,
         )
         tesseract_debug.update(t_debug)
+    if ocr_engine == "tesseract":
+        final_winner = tesseract_result
+        selected_engine = "tesseract"
         if tesseract_result is not None:
-            final_winner = tesseract_result
             chosen_pass = "tesseract"
             chosen_method = "fallback_tesseract"
+    elif ocr_engine == "both":
+        if easyocr_winner is not None and not easyocr_unusable:
+            final_winner = easyocr_winner
+            selected_engine = "easyocr"
+        elif tesseract_result is not None:
+            final_winner = tesseract_result
+            selected_engine = "tesseract"
+            chosen_pass = "tesseract"
+            chosen_method = "fallback_tesseract"
+    elif tesseract_result is not None:
+        final_winner = tesseract_result
+        selected_engine = "tesseract"
+        chosen_pass = "tesseract"
+        chosen_method = "fallback_tesseract"
 
     ocr_exception = None
     ocr_traceback = None
@@ -1245,11 +1282,17 @@ def ocr_numeric_roi(
         "tesseract_raw": tesseract_debug.get("tesseract_raw", ""),
         "tesseract_config": tesseract_debug.get("tesseract_config"),
         "tesseract_exception": tesseract_debug.get("tesseract_exception"),
+        "tesseract_psm": tesseract_result.get("psm") if isinstance(tesseract_result, dict) else None,
+        "tesseract_oem": tesseract_result.get("oem") if isinstance(tesseract_result, dict) else None,
+        "tesseract_whitelist": tesseract_result.get("whitelist") if isinstance(tesseract_result, dict) else None,
+        "easyocr_candidate": easyocr_winner,
+        "selected_engine": selected_engine,
     }
     debug_images = {
         "raw": img,
         "tight": subimg,
         "pre": preprocessed_image,
+        "tess": preprocessed_image,
         "passes": pass_image_map,
     }
 
@@ -1261,6 +1304,9 @@ def ocr_numeric_roi(
             "method": final_winner["method"],
             "ocr_pass": final_winner["ocr_pass"],
             "imputed": False,
+            "selected_engine": selected_engine,
+            "easyocr": easyocr_winner,
+            "tesseract": tesseract_result,
             "debug": debug_payload,
             "debug_images": debug_images,
         }
@@ -1273,6 +1319,9 @@ def ocr_numeric_roi(
             "method": "hold_last",
             "ocr_pass": "none",
             "imputed": True,
+            "selected_engine": selected_engine,
+            "easyocr": easyocr_winner,
+            "tesseract": tesseract_result,
             "debug": debug_payload,
             "debug_images": debug_images,
         }
@@ -1284,6 +1333,9 @@ def ocr_numeric_roi(
         "method": "no_match",
         "ocr_pass": "none",
         "imputed": False,
+        "selected_engine": selected_engine,
+        "easyocr": easyocr_winner,
+        "tesseract": tesseract_result,
         "debug": debug_payload,
         "debug_images": debug_images,
     }
@@ -1303,7 +1355,7 @@ def should_save_failed_roi(
     confidence_threshold: float,
 ) -> tuple[bool, str]:
     if text == "" or value is None:
-        return True, "empty_text_or_none_value"
+        return True, "empty"
 
     method = str(ocr_result.get("method") or "")
     if method in {"no_match", "fallback_tesseract"}:
@@ -1312,13 +1364,13 @@ def should_save_failed_roi(
     conf_value = safe_float(ocr_result.get("conf"))
     conf = conf_value if conf_value is not None else 0.0
     if conf < float(confidence_threshold):
-        return True, f"low_confidence_lt_{float(confidence_threshold):.2f}"
+        return True, "low_conf"
 
     debug = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     if debug.get("exception"):
         return True, "exception"
     if _raw_easyocr_all_empty(debug.get("raw_easyocr")):
-        return True, "easyocr_detection_empty"
+        return True, "parse_fail"
     return False, ""
 
 
@@ -1348,16 +1400,19 @@ def save_failed_roi_artifacts(
     fail_roi_dir: Path,
     *,
     timestamp: str,
+    image_basename: str,
+    image_path: str | None,
     bed: str,
     field: str,
     reason: str,
     roi_coords: tuple[int, int, int, int],
     ocr_result: dict[str, Any],
     debug_popup_failed_roi: bool,
+    elapsed_ms: float,
 ) -> list[str]:
     fail_roi_dir.mkdir(parents=True, exist_ok=True)
     safe_reason = re.sub(r"[^A-Za-z0-9_.-]", "_", reason)
-    prefix = f"{bed}_{field}_{timestamp}_{safe_reason}"
+    prefix = f"{image_basename}_{bed}_{field}"
     debug_images = ocr_result.get("debug_images") if isinstance(ocr_result.get("debug_images"), dict) else {}
     debug_meta = ocr_result.get("debug") if isinstance(ocr_result.get("debug"), dict) else {}
     saved_files: list[str] = []
@@ -1374,10 +1429,17 @@ def save_failed_roi_artifacts(
             _show_failed_roi_popup(raw_img, bed=bed, field=field)
 
     pass_images = debug_images.get("passes") if isinstance(debug_images.get("passes"), dict) else {}
+    tess_img = debug_images.get("tess")
+    if isinstance(tess_img, np.ndarray) and tess_img.size > 0 and bool(debug_meta.get("tesseract_used", False)):
+        tess_path = fail_roi_dir / f"{prefix}_tess.png"
+        if _safe_write_image(tess_path, tess_img):
+            paths["passes"]["tess"] = tess_path.as_posix()
+            saved_files.append(tess_path.name)
+
     for pass_name, pass_img in pass_images.items():
         if not isinstance(pass_img, np.ndarray) or pass_img.size == 0:
             continue
-        pass_path = fail_roi_dir / f"{prefix}_{pass_name}.png"
+        pass_path = fail_roi_dir / f"{prefix}_pre_{pass_name}.png"
         if _safe_write_image(pass_path, pass_img):
             paths["passes"][pass_name] = pass_path.as_posix()
             saved_files.append(pass_path.name)
@@ -1387,17 +1449,34 @@ def save_failed_roi_artifacts(
 
     meta = {
         "timestamp": timestamp,
+        "image_path": image_path,
         "bed": bed,
         "field": field,
         "reason": safe_reason,
         "roi_coords": [int(v) for v in roi_coords],
-        "result": {
+        "easyocr_result": {
+            "text": (ocr_result.get("easyocr") or {}).get("text", "") if isinstance(ocr_result.get("easyocr"), dict) else "",
+            "value": (ocr_result.get("easyocr") or {}).get("value") if isinstance(ocr_result.get("easyocr"), dict) else None,
+            "conf": (ocr_result.get("easyocr") or {}).get("conf") if isinstance(ocr_result.get("easyocr"), dict) else None,
+            "pass": (ocr_result.get("easyocr") or {}).get("ocr_pass") if isinstance(ocr_result.get("easyocr"), dict) else None,
+        },
+        "tesseract_result": {
+            "text": (ocr_result.get("tesseract") or {}).get("text", "") if isinstance(ocr_result.get("tesseract"), dict) else "",
+            "value": (ocr_result.get("tesseract") or {}).get("value") if isinstance(ocr_result.get("tesseract"), dict) else None,
+            "conf": None,
+            "psm": debug_meta.get("tesseract_psm"),
+            "oem": debug_meta.get("tesseract_oem"),
+            "whitelist": debug_meta.get("tesseract_whitelist"),
+        },
+        "selected_result": {
+            "engine": ocr_result.get("selected_engine", "easyocr"),
             "text": ocr_result.get("text", ""),
             "value": ocr_result.get("value"),
             "conf": ocr_result.get("conf"),
             "ocr_method": ocr_result.get("method", "none"),
             "ocr_pass": ocr_result.get("ocr_pass", "none"),
         },
+        "elapsed_ms": elapsed_ms,
         "preprocess_passes_tried": debug_meta.get("preprocess_passes_tried", []),
         "chosen_pass": debug_meta.get("chosen_pass", "none"),
         "chosen_method": debug_meta.get("chosen_method", "none"),
@@ -2253,11 +2332,15 @@ def main() -> None:
     parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
     parser.add_argument("--save-fail-roi", type=parse_bool, default=None)
-    parser.add_argument("--fail-roi-dir", default="day_dir/failed_rois")
+    parser.add_argument("--fail-roi-dir", default="day_dir/failed_roi")
     parser.add_argument("--fail-roi-fields", default="CVP_M,RAP_M")
     parser.add_argument("--fail-roi-max-per-tick", type=int, default=20)
     parser.add_argument("--tesseract-fallback", type=parse_bool, default=None)
     parser.add_argument("--tesseract-cmd", default="")
+    parser.add_argument("--ocr-engine", choices=["easyocr", "tesseract", "both"], default="easyocr")
+    parser.add_argument("--tess-fields", default="")
+    parser.add_argument("--debug-save-failed-roi", action="store_true")
+    parser.add_argument("--save-lowconf-roi-threshold", type=float, default=0.50)
     parser.add_argument("--gpu", type=parse_bool, default=True)
     parser.add_argument("--no-launch-monitor", type=parse_bool, default=True)  # MOD: 安全側デフォルト
     parser.add_argument("--run-validator", type=parse_bool, default=False)  # MOD
@@ -2270,6 +2353,9 @@ def main() -> None:
     fail_roi_fields_raw = str(args.fail_roi_fields or "").strip()
     if fail_roi_fields_raw:
         fail_roi_fields = {item.strip() for item in fail_roi_fields_raw.split(",") if item.strip()}
+
+    tess_fields_raw = str(args.tess_fields or "").strip()
+    tess_fields = {item.strip() for item in tess_fields_raw.split(",") if item.strip()} if tess_fields_raw else set()
 
     dpi_aware()
     log_windows_dpi_info()
@@ -2337,6 +2423,7 @@ def main() -> None:
         try:
             while True:
                 tick = time.time()
+                frame_start = time.perf_counter()
                 print(f"[INFO] capture tick start ts={datetime.now().isoformat(timespec='seconds')}")
                 try:
                     day = datetime.now().strftime("%Y%m%d")
@@ -2409,6 +2496,7 @@ def main() -> None:
                     if args.save_images:
                         image_path = images_dir / f"{stamp}.png"
                         cv2.imwrite(str(image_path), frame)
+                    image_basename = image_path.stem if image_path is not None else stamp
 
                     cache_snapshot_before = copy_cache_snapshot(cache_path, day_dir, f"{stamp}_before")
                     if not cache_snapshot_before:
@@ -2486,12 +2574,14 @@ def main() -> None:
                     save_fail_roi = bool(config.get("debug_save_failed_roi", True))
                     if args.save_fail_roi is not None:
                         save_fail_roi = save_fail_roi and bool(args.save_fail_roi)
+                    if args.debug_save_failed_roi:
+                        save_fail_roi = True
 
-                    fail_roi_conf_threshold = safe_float(config.get("failed_roi_conf_threshold"))
+                    fail_roi_conf_threshold = safe_float(args.save_lowconf_roi_threshold)
                     if fail_roi_conf_threshold is None:
-                        fail_roi_conf_threshold = 0.70
+                        fail_roi_conf_threshold = 0.50
                     debug_popup_failed_roi = bool(config.get("debug_popup_failed_roi", False))
-                    fail_roi_dir = day_dir / "failed_rois" if args.fail_roi_dir == "day_dir/failed_rois" else Path(args.fail_roi_dir)
+                    fail_roi_dir = day_dir / "failed_roi" if args.fail_roi_dir == "day_dir/failed_roi" else Path(args.fail_roi_dir)
                     if save_fail_roi:
                         fail_roi_dir.mkdir(parents=True, exist_ok=True)
                     fail_roi_saved_in_tick = 0
@@ -2503,16 +2593,17 @@ def main() -> None:
                             roi_box = rect_map.get(bed, {}).get(vital)
                             if roi_box is None:
                                 missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
-                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "no_roi", "imputed": False, "ocr_pass": "none"}
+                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "no_roi", "imputed": False, "ocr_pass": "none", "selected_engine": "none"}
                                 continue
 
                             roi_crop_raw: np.ndarray | None = None
                             roi_coords: tuple[int, int, int, int] | None = None
+                            roi_start = time.perf_counter()
                             try:
                                 roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
                                 if roi_crop_raw is None or roi_coords is None:
                                     missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
-                                    beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "crop_failed", "imputed": False, "ocr_pass": "none"}
+                                    beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "crop_failed", "imputed": False, "ocr_pass": "none", "selected_engine": "none"}
                                     continue
 
                                 if args.debug_roi and roi_debug_input_dir is not None:
@@ -2533,12 +2624,16 @@ def main() -> None:
                                         )
 
                                 prior_value = last_confirmed_values.get(bed, {}).get(vital)
+                                run_tesseract_for_field = args.ocr_engine == "both" and (not tess_fields or vital in tess_fields)
                                 ocr_result = ocr_numeric_roi(
                                     roi_for_ocr,
                                     reader,
                                     field_name=vital,
                                     prior_value=prior_value,
                                     config=config,
+                                    ocr_engine=args.ocr_engine,
+                                    run_tesseract_for_field=run_tesseract_for_field,
+                                    low_conf_threshold=fail_roi_conf_threshold,
                                 )
                                 text = str(ocr_result.get("text") or "")
                                 value = ocr_result.get("value")
@@ -2548,6 +2643,16 @@ def main() -> None:
                                 ocr_pass = str(ocr_result.get("ocr_pass") or "none")
                                 imputed = bool(ocr_result.get("imputed", False))
 
+                                roi_elapsed_ms = (time.perf_counter() - roi_start) * 1000.0
+                                selected_engine = str(ocr_result.get("selected_engine") or "easyocr")
+                                alt_ocr: dict[str, Any] = {}
+                                if isinstance(ocr_result.get("tesseract"), dict):
+                                    alt_ocr["tesseract"] = {
+                                        "text": ocr_result["tesseract"].get("text", ""),
+                                        "value": ocr_result["tesseract"].get("value"),
+                                        "psm": ocr_result["tesseract"].get("psm"),
+                                        "oem": ocr_result["tesseract"].get("oem"),
+                                    }
                                 beds[bed][vital] = {
                                     "text": text,
                                     "value": value,
@@ -2556,7 +2661,12 @@ def main() -> None:
                                     "ocr_conf": conf_value,
                                     "imputed": imputed,
                                     "ocr_pass": ocr_pass,
+                                    "selected_engine": selected_engine,
+                                    "roi_elapsed_ms": roi_elapsed_ms,
                                 }
+                                if alt_ocr:
+                                    beds[bed][vital]["alt_ocr"] = alt_ocr
+                                print(f"[PERF] roi_elapsed_ms bed={bed} field={vital} ms={roi_elapsed_ms:.2f}")
 
                                 if value is not None and not imputed:
                                     last_confirmed_values.setdefault(bed, {})[vital] = value
@@ -2581,12 +2691,15 @@ def main() -> None:
                                     saved_files = save_failed_roi_artifacts(
                                         fail_roi_dir,
                                         timestamp=stamp,
+                                        image_basename=image_basename,
+                                        image_path=image_path.as_posix() if image_path else None,
                                         bed=bed,
                                         field=vital,
                                         reason=save_reason,
                                         roi_coords=roi_coords,
                                         ocr_result=ocr_result,
                                         debug_popup_failed_roi=debug_popup_failed_roi,
+                                        elapsed_ms=roi_elapsed_ms,
                                     )
                                     fail_roi_saved_in_tick += 1
                                     print(
@@ -2610,6 +2723,8 @@ def main() -> None:
                                     "ocr_conf": None,
                                     "imputed": False,
                                     "ocr_pass": "none",
+                                    "selected_engine": "none",
+                                    "roi_elapsed_ms": (time.perf_counter() - roi_start) * 1000.0,
                                 }
                                 bed_debug[vital] = {"error": err_msg}
 
@@ -2641,12 +2756,15 @@ def main() -> None:
                                     saved_files = save_failed_roi_artifacts(
                                         fail_roi_dir,
                                         timestamp=stamp,
+                                        image_basename=image_basename,
+                                        image_path=image_path.as_posix() if image_path else None,
                                         bed=bed,
                                         field=vital,
-                                        reason="exception",
+                                        reason="parse_fail",
                                         roi_coords=roi_coords if roi_coords is not None else (0, 0, 0, 0),
                                         ocr_result=ocr_result_err,
                                         debug_popup_failed_roi=debug_popup_failed_roi,
+                                        elapsed_ms=(time.perf_counter() - roi_start) * 1000.0,
                                     )
                                     fail_roi_saved_in_tick += 1
                                     print(
@@ -2666,11 +2784,14 @@ def main() -> None:
                     if not cache_snapshot:
                         print(f"[WARN] cache snapshot failed at {stamp}", file=sys.stderr)
 
+                    frame_elapsed_ms = (time.perf_counter() - frame_start) * 1000.0
+                    print(f"[PERF] frame_elapsed_ms={frame_elapsed_ms:.2f}")
                     record = {
                         "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                         "image_path": image_path.as_posix() if image_path else None,
                         "cache_snapshot_path_before": cache_snapshot_before,
                         "cache_snapshot_path": cache_snapshot,
+                        "frame_elapsed_ms": frame_elapsed_ms,
                         "beds": beds,
                     }
                     if record_debug:
