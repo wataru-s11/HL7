@@ -2359,7 +2359,12 @@ def main() -> None:
     parser.add_argument("--validator-last", type=int, default=50)  # MOD
     parser.add_argument("--validator-config", default="validator_config.json")  # MOD
     parser.add_argument("--calibrate", action="store_true")
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+    if unknown_args:
+        unsupported_args = [token for token in unknown_args if token != "^"]
+        if unsupported_args:
+            parser.error(f"unrecognized arguments: {' '.join(unsupported_args)}")
+        print("[WARN] ignoring trailing '^' token in command line", file=sys.stderr)
 
     fail_roi_fields: set[str] | None = None
     fail_roi_fields_raw = str(args.fail_roi_fields or "").strip()
