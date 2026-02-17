@@ -16,6 +16,7 @@ import argparse
 import ctypes
 import json
 import importlib
+import os
 import unicodedata
 import re
 import shutil
@@ -163,6 +164,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "failed_roi_conf_threshold": 0.70,
     "debug_popup_failed_roi": False,
     "enable_tesseract_fallback": True,
+    "ocr_compare_mode": False,
     "tesseract_cmd": "",
     "vital_ranges": DEFAULT_VITAL_RANGES,
 }
@@ -1034,11 +1036,22 @@ def _get_pytesseract(config: dict[str, Any]) -> Any | None:
 def _normalize_tesseract_text(text: str, allowlist: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     normalized = normalized.strip().replace(" ", "").replace("\n", "")
+    normalized = "".join(ch for ch in normalized if not ch.isspace())
     filtered = "".join(ch for ch in normalized if ch in allowlist)
     if not filtered and "O" in normalized and "0" in allowlist:
         maybe = normalized.replace("O", "0").replace("o", "0")
         filtered = "".join(ch for ch in maybe if ch in allowlist)
-    return _normalize_ocr_text(filtered, allowlist)
+
+    cleaned = _normalize_ocr_text(filtered, allowlist)
+    if "." in allowlist and cleaned:
+        # Tesseractの端数記号ゆらぎを吸収: "7." -> "7", ".7" -> "0.7", "-.7" -> "-0.7"
+        if cleaned.endswith("."):
+            cleaned = cleaned[:-1]
+        if cleaned.startswith("-."):
+            cleaned = "-0" + cleaned[1:]
+        elif cleaned.startswith("."):
+            cleaned = "0" + cleaned
+    return cleaned
 
 
 def _tesseract_read_numeric(
@@ -1120,6 +1133,7 @@ def ocr_numeric_roi(
     allowlist = _field_allowlist(field)
     pattern = _field_pattern(field, allowlist)
     cfg = config if isinstance(config, dict) else DEFAULT_CONFIG
+    compare_mode = bool(cfg.get("ocr_compare_mode", False))
 
     if field in {"CVP_M", "RAP_M"}:
         subimg, tighten_debug = foreground_auto_tighten(img)
@@ -1221,7 +1235,9 @@ def ocr_numeric_roi(
     easyocr_unusable = easyocr_failed or easyocr_low_conf
 
     should_run_tesseract = False
-    if ocr_engine == "tesseract":
+    if compare_mode:
+        should_run_tesseract = True
+    elif ocr_engine == "tesseract":
         should_run_tesseract = True
     elif ocr_engine == "both":
         should_run_tesseract = run_tesseract_for_field
@@ -2380,6 +2396,8 @@ def main() -> None:
     config_path = Path(args.config)
     config = ensure_config(config_path)
     config["window_title"] = args.window_title
+    config["ocr_compare_mode"] = parse_bool(os.environ.get("OCR_COMPARE_MODE", "false"))
+    print(f"[INFO] OCR_COMPARE_MODE={str(config['ocr_compare_mode']).lower()}")
     if args.tesseract_fallback is not None:
         config["enable_tesseract_fallback"] = bool(args.tesseract_fallback)
     if str(args.tesseract_cmd or "").strip():
@@ -2698,7 +2716,7 @@ def main() -> None:
                                 easy_conf = safe_float(easy_result.get("conf")) if easy_result else None
                                 tess_value = safe_float(tess_result.get("value")) if tess_result else None
                                 tess_conf = safe_float(tess_result.get("conf")) if tess_result else None
-                                if imputed and method == "hold_last":
+                                if imputed and method == "hold_last" and not bool(config.get("ocr_compare_mode", False)):
                                     easy_value = None
                                     tess_value = None
                                 alt_ocr: dict[str, Any] = {}
