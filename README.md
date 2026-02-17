@@ -148,6 +148,9 @@ python ocr_capture_app.py --cache monitor_cache.json --debug-roi true --save-ima
 
 # validator 単体実行（最新50件）
 python validator.py --ocr-results dataset/20260216/ocr_results.jsonl --monitor-cache monitor_cache.json --validator-config validator_config.json --last 50
+
+# EasyOCR/Tesseract/truth の同一フレーム比較（StepB 勝敗表生成）
+python tools/compare_ocr_engines.py --ocr-results dataset/20260217/ocr_results.jsonl --out-dir dataset/20260217/compare
 ```
 
 ### 主なオプション
@@ -164,4 +167,3 @@ python validator.py --ocr-results dataset/20260216/ocr_results.jsonl --monitor-c
 - `dataset/<YYYYMMDD>/images/*.png` : フレーム画像
 - `dataset/<YYYYMMDD>/ocr_results.jsonl` : 1フレーム=1JSON（append）
 - `dataset/<YYYYMMDD>/validation_results.jsonl` : validator比較結果
-
