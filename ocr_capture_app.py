@@ -1156,6 +1156,8 @@ def ocr_numeric_roi(
         "tesseract_config": None,
         "tesseract_exception": None,
     }
+    easy_elapsed_ms: float = 0.0
+    tess_elapsed_ms: float | None = None
 
     def run_pass(pass_name: str, method: str) -> None:
         nonlocal preprocessed_image, chosen_pass, chosen_method
@@ -1193,6 +1195,7 @@ def ocr_numeric_roi(
             chosen_pass = pass_name
             chosen_method = method
 
+    easy_start = time.perf_counter()
     for pass_name in ("gray", "otsu"):
         run_pass(pass_name, method="preprocess_multi_pass")
         if candidates:
@@ -1200,6 +1203,7 @@ def ocr_numeric_roi(
 
     if not candidates:
         run_pass("otsu_inv", method="preprocess_multi_pass")
+    easy_elapsed_ms = (time.perf_counter() - easy_start) * 1000.0
 
     easyocr_winner = max(candidates, key=lambda c: c.get("score", -1.0)) if candidates else None
     easyocr_failed = (
@@ -1227,6 +1231,7 @@ def ocr_numeric_roi(
     final_winner = easyocr_winner
     tesseract_result = None
     if should_run_tesseract:
+        tess_start = time.perf_counter()
         tesseract_result, t_debug = _tesseract_read_numeric(
             preprocessed_image,
             allowlist=allowlist,
@@ -1236,6 +1241,7 @@ def ocr_numeric_roi(
             config=cfg,
             tighten_debug=tighten_debug,
         )
+        tess_elapsed_ms = (time.perf_counter() - tess_start) * 1000.0
         tesseract_debug.update(t_debug)
     if ocr_engine == "tesseract":
         final_winner = tesseract_result
@@ -1307,6 +1313,8 @@ def ocr_numeric_roi(
             "selected_engine": selected_engine,
             "easyocr": easyocr_winner,
             "tesseract": tesseract_result,
+            "easy_elapsed_ms": easy_elapsed_ms,
+            "tess_elapsed_ms": tess_elapsed_ms,
             "debug": debug_payload,
             "debug_images": debug_images,
         }
@@ -1322,6 +1330,8 @@ def ocr_numeric_roi(
             "selected_engine": selected_engine,
             "easyocr": easyocr_winner,
             "tesseract": tesseract_result,
+            "easy_elapsed_ms": easy_elapsed_ms,
+            "tess_elapsed_ms": tess_elapsed_ms,
             "debug": debug_payload,
             "debug_images": debug_images,
         }
@@ -1336,6 +1346,8 @@ def ocr_numeric_roi(
         "selected_engine": selected_engine,
         "easyocr": easyocr_winner,
         "tesseract": tesseract_result,
+        "easy_elapsed_ms": easy_elapsed_ms,
+        "tess_elapsed_ms": tess_elapsed_ms,
         "debug": debug_payload,
         "debug_images": debug_images,
     }
@@ -2593,7 +2605,22 @@ def main() -> None:
                             roi_box = rect_map.get(bed, {}).get(vital)
                             if roi_box is None:
                                 missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
-                                beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "no_roi", "imputed": False, "ocr_pass": "none", "selected_engine": "none"}
+                                beds[bed][vital] = {
+                                    "text": "",
+                                    "value": None,
+                                    "confidence": 0.0,
+                                    "ocr_method": "no_roi",
+                                    "imputed": False,
+                                    "ocr_pass": "none",
+                                    "selected_engine": None,
+                                    "easy_value": None,
+                                    "easy_conf": None,
+                                    "tess_value": None,
+                                    "tess_conf": None,
+                                    "selected_value": None,
+                                    "easy_elapsed_ms": None,
+                                    "tess_elapsed_ms": None,
+                                }
                                 continue
 
                             roi_crop_raw: np.ndarray | None = None
@@ -2603,7 +2630,22 @@ def main() -> None:
                                 roi_crop_raw, roi_coords = crop_red_roi(frame, roi_box, bed, vital)
                                 if roi_crop_raw is None or roi_coords is None:
                                     missing_by_field[vital] = missing_by_field.get(vital, 0) + 1
-                                    beds[bed][vital] = {"text": "", "value": None, "confidence": 0.0, "ocr_method": "crop_failed", "imputed": False, "ocr_pass": "none", "selected_engine": "none"}
+                                    beds[bed][vital] = {
+                                        "text": "",
+                                        "value": None,
+                                        "confidence": 0.0,
+                                        "ocr_method": "crop_failed",
+                                        "imputed": False,
+                                        "ocr_pass": "none",
+                                        "selected_engine": None,
+                                        "easy_value": None,
+                                        "easy_conf": None,
+                                        "tess_value": None,
+                                        "tess_conf": None,
+                                        "selected_value": None,
+                                        "easy_elapsed_ms": None,
+                                        "tess_elapsed_ms": None,
+                                    }
                                     continue
 
                                 if args.debug_roi and roi_debug_input_dir is not None:
@@ -2645,6 +2687,15 @@ def main() -> None:
 
                                 roi_elapsed_ms = (time.perf_counter() - roi_start) * 1000.0
                                 selected_engine = str(ocr_result.get("selected_engine") or "easyocr")
+                                easy_result = ocr_result.get("easyocr") if isinstance(ocr_result.get("easyocr"), dict) else None
+                                tess_result = ocr_result.get("tesseract") if isinstance(ocr_result.get("tesseract"), dict) else None
+                                easy_value = safe_float(easy_result.get("value")) if easy_result else None
+                                easy_conf = safe_float(easy_result.get("conf")) if easy_result else None
+                                tess_value = safe_float(tess_result.get("value")) if tess_result else None
+                                tess_conf = safe_float(tess_result.get("conf")) if tess_result else None
+                                if imputed and method == "hold_last":
+                                    easy_value = None
+                                    tess_value = None
                                 alt_ocr: dict[str, Any] = {}
                                 if isinstance(ocr_result.get("tesseract"), dict):
                                     alt_ocr["tesseract"] = {
@@ -2662,7 +2713,14 @@ def main() -> None:
                                     "imputed": imputed,
                                     "ocr_pass": ocr_pass,
                                     "selected_engine": selected_engine,
+                                    "easy_value": easy_value,
+                                    "easy_conf": easy_conf,
+                                    "tess_value": tess_value,
+                                    "tess_conf": tess_conf,
+                                    "selected_value": value,
                                     "roi_elapsed_ms": roi_elapsed_ms,
+                                    "easy_elapsed_ms": safe_float(ocr_result.get("easy_elapsed_ms")),
+                                    "tess_elapsed_ms": safe_float(ocr_result.get("tess_elapsed_ms")),
                                 }
                                 if alt_ocr:
                                     beds[bed][vital]["alt_ocr"] = alt_ocr
@@ -2723,8 +2781,15 @@ def main() -> None:
                                     "ocr_conf": None,
                                     "imputed": False,
                                     "ocr_pass": "none",
-                                    "selected_engine": "none",
+                                    "selected_engine": None,
+                                    "easy_value": None,
+                                    "easy_conf": None,
+                                    "tess_value": None,
+                                    "tess_conf": None,
+                                    "selected_value": None,
                                     "roi_elapsed_ms": (time.perf_counter() - roi_start) * 1000.0,
+                                    "easy_elapsed_ms": None,
+                                    "tess_elapsed_ms": None,
                                 }
                                 bed_debug[vital] = {"error": err_msg}
 
