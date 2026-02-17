@@ -439,6 +439,115 @@ def resolve_mss_monitor_index(
     return selected
 
 
+def _resize_for_monitor_scoring(frame: np.ndarray, max_dim: int = 640) -> np.ndarray:
+    h, w = frame.shape[:2]
+    scale = min(1.0, float(max_dim) / float(max(h, w, 1)))
+    if scale >= 0.999:
+        return frame
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def auto_detect_monitor(sct: mss.mss, debug: bool = False) -> tuple[int | None, float, list[dict[str, float]]]:
+    """Estimate the monitor showing fullscreen HL7 monitor UI.
+
+    Heuristics prioritize dark background and grid-like lines, then colorful/white
+    text ratios (cyan/red/white) used by the monitor UI.
+    """
+    monitor_count = len(sct.monitors) - 1
+    if monitor_count <= 0:
+        return None, 0.0, []
+
+    candidates: list[dict[str, float]] = []
+    for idx in range(1, monitor_count + 1):
+        mon = sct.monitors[idx]
+        try:
+            raw = sct.grab({"left": int(mon["left"]), "top": int(mon["top"]), "width": int(mon["width"]), "height": int(mon["height"])})
+            frame = cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2BGR)
+        except Exception as exc:
+            print(f"[WARN] auto_detect_monitor monitor={idx} capture failed: {exc}", file=sys.stderr)
+            continue
+
+        small = _resize_for_monitor_scoring(frame, max_dim=640)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        h, w = small.shape[:2]
+        px = float(max(h * w, 1))
+
+        black_mask = cv2.inRange(hsv, (0, 0, 0), (180, 80, 45))
+        cyan_mask = cv2.inRange(hsv, (75, 70, 110), (105, 255, 255))
+        red_mask1 = cv2.inRange(hsv, (0, 80, 90), (10, 255, 255))
+        red_mask2 = cv2.inRange(hsv, (165, 80, 90), (180, 255, 255))
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+        white_mask = cv2.inRange(hsv, (0, 0, 170), (180, 45, 255))
+
+        black_ratio = float(cv2.countNonZero(black_mask) / px)
+        cyan_ratio = float(cv2.countNonZero(cyan_mask) / px)
+        red_ratio = float(cv2.countNonZero(red_mask) / px)
+        white_ratio = float(cv2.countNonZero(white_mask) / px)
+
+        line_info = detect_grid_lines(small)
+        horizontal_mask = line_info.get("horizontal_mask")
+        vertical_mask = line_info.get("vertical_mask")
+        line_px = 0.0
+        if isinstance(horizontal_mask, np.ndarray):
+            line_px += float(cv2.countNonZero(horizontal_mask))
+        if isinstance(vertical_mask, np.ndarray):
+            line_px += float(cv2.countNonZero(vertical_mask))
+        line_mask_ratio = line_px / px
+        line_count = float(len(line_info.get("x_lines", [])) + len(line_info.get("y_lines", [])))
+        line_strength = min(1.0, line_mask_ratio * 8.0 + min(line_count / 16.0, 1.0) * 0.5)
+
+        score = (
+            0.45 * black_ratio
+            + 0.35 * line_strength
+            + 0.12 * min(cyan_ratio * 12.0, 1.0)
+            + 0.05 * min(red_ratio * 12.0, 1.0)
+            + 0.03 * min(white_ratio * 8.0, 1.0)
+        )
+        candidates.append(
+            {
+                "index": float(idx),
+                "score": float(score),
+                "black_ratio": black_ratio,
+                "line_strength": line_strength,
+                "cyan_ratio": cyan_ratio,
+                "red_ratio": red_ratio,
+                "white_ratio": white_ratio,
+            }
+        )
+
+    if not candidates:
+        return None, 0.0, []
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    best = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+    best_score = float(best["score"])
+    margin = best_score - float(second["score"]) if second else best_score
+    confident = best_score >= 0.20 and margin >= 0.03
+
+    if debug:
+        for item in candidates:
+            print(
+                "[DEBUG] auto_detect_monitor candidate "
+                f"mss-monitor-index={int(item['index'])} score={item['score']:.4f} "
+                f"black_ratio={item['black_ratio']:.4f} line_strength={item['line_strength']:.4f} "
+                f"cyan_ratio={item['cyan_ratio']:.4f} red_ratio={item['red_ratio']:.4f} "
+                f"white_ratio={item['white_ratio']:.4f}"
+            )
+
+    if not confident:
+        if debug:
+            print(
+                "[DEBUG] auto_detect_monitor low confidence "
+                f"best_score={best_score:.4f} margin={margin:.4f}; fallback to primary"
+            )
+        return None, best_score, candidates
+
+    return int(best["index"]), best_score, candidates
+
+
 def log_windows_dpi_info() -> None:
     if not sys.platform.startswith("win"):
         return
@@ -587,6 +696,21 @@ def choose_capture_region(
         windows_monitors=windows_monitors,
         display_index=display_index,
         mss_monitor_index=mss_monitor_index,
+    )
+    monitor = sct.monitors[selected]
+    return CaptureRegion(int(monitor["left"]), int(monitor["top"]), int(monitor["width"]), int(monitor["height"]))
+
+
+def get_primary_mss_monitor_base(
+    sct: mss.mss,
+    windows_monitors: list[dict[str, int | bool]],
+) -> CaptureRegion:
+    selected = resolve_mss_monitor_index(
+        sct=sct,
+        target_display="primary",
+        windows_monitors=windows_monitors,
+        display_index=None,
+        mss_monitor_index=None,
     )
     monitor = sct.monitors[selected]
     return CaptureRegion(int(monitor["left"]), int(monitor["top"]), int(monitor["width"]), int(monitor["height"]))
@@ -2411,6 +2535,8 @@ def main() -> None:
     parser.add_argument("--target-display", choices=["primary", "index", "mss"], default="primary")
     parser.add_argument("--display-index", type=int, default=None)
     parser.add_argument("--mss-monitor-index", type=int, default=None)
+    parser.add_argument("--auto-detect-monitor", type=parse_bool, default=True)
+    parser.add_argument("--auto-detect-debug", type=parse_bool, default=False)
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
@@ -2536,13 +2662,31 @@ def main() -> None:
                         if capture_rect is None:
                             print(f"[INFO] window found=not found title='{args.window_title}'")
                             if mss_fallback_base is None:
-                                mss_fallback_base = choose_capture_region(
-                                    sct,
-                                    args.target_display,
-                                    windows_monitors,
-                                    args.display_index,
-                                    args.mss_monitor_index,
-                                )
+                                selected_index: int | None = None
+                                selected_score = 0.0
+                                if args.auto_detect_monitor:
+                                    selected_index, selected_score, _candidate_scores = auto_detect_monitor(
+                                        sct,
+                                        debug=bool(args.auto_detect_debug),
+                                    )
+                                if selected_index is not None:
+                                    mon = sct.monitors[selected_index]
+                                    mss_fallback_base = CaptureRegion(
+                                        int(mon["left"]),
+                                        int(mon["top"]),
+                                        int(mon["width"]),
+                                        int(mon["height"]),
+                                    )
+                                    print(
+                                        "[INFO] auto_detect_monitor selected "
+                                        f"mss-monitor-index={selected_index} score={selected_score:.4f}"
+                                    )
+                                else:
+                                    mss_fallback_base = get_primary_mss_monitor_base(sct, windows_monitors)
+                                    print(
+                                        "[INFO] auto_detect_monitor selected "
+                                        "mss-monitor-index=primary-fallback score=0.0000"
+                                    )
                                 mss_fallback_rect = get_monitor_rect(config, mss_fallback_base)
                             assert mss_fallback_base is not None
                             assert mss_fallback_rect is not None
