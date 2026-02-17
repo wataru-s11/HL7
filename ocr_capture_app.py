@@ -1054,6 +1054,22 @@ def _normalize_tesseract_text(text: str, allowlist: str) -> str:
     return cleaned
 
 
+def _build_tesseract_pass_images(image: np.ndarray) -> dict[str, np.ndarray]:
+    gray = to_gray(image)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    otsu_inv = cv2.bitwise_not(otsu)
+    adaptive = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 2)
+    adaptive_inv = cv2.bitwise_not(adaptive)
+    return {
+        "gray": gray,
+        "otsu": otsu,
+        "otsu_inv": otsu_inv,
+        "adaptive": adaptive,
+        "adaptive_inv": adaptive_inv,
+    }
+
+
 def _tesseract_read_numeric(
     image: np.ndarray,
     *,
@@ -1077,39 +1093,81 @@ def _tesseract_read_numeric(
         return None, debug
 
     whitelist = "".join(ch for ch in allowlist if ch in "0123456789.-") or "0123456789."
-    psm_candidates = [7, 8]
+    psm_candidates = [7, 8, 6, 13]
+    oem_candidates = [1, 3]
     tess_cfg = ""
     debug["tesseract_used"] = True
     debug["psm_candidates"] = psm_candidates
+    debug["oem_candidates"] = oem_candidates
     debug["whitelist"] = whitelist
+    pass_images = _build_tesseract_pass_images(image)
+    debug["passes"] = list(pass_images.keys())
+    best_attempt: dict[str, Any] | None = None
 
     try:
-        for psm in psm_candidates:
-            tess_cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist={whitelist}"
-            debug["tesseract_config"] = tess_cfg
-            raw_text = str(pytesseract.image_to_string(image, config=tess_cfg))
-            debug["tesseract_raw"] = raw_text
-            norm_text = _normalize_tesseract_text(raw_text, allowlist)
-            debug["tesseract_text"] = norm_text
-            if not norm_text or pattern.match(norm_text) is None:
-                continue
-            value = _parse_value_with_allowlist(norm_text, field_name, config)
-            if value is None:
-                continue
-            score = _score_candidate(norm_text, 1.0, True, value, prior_value)
-            result = {
-                "text": norm_text,
-                "value": value,
-                "conf": None,
-                "method": "fallback_tesseract",
-                "ocr_pass": "tesseract",
-                "imputed": False,
-                "score": score,
-                "psm": psm,
-                "oem": 1,
-                "whitelist": whitelist,
-            }
-            return result, debug
+        output_cls = getattr(pytesseract, "Output", None)
+        output_dict = getattr(output_cls, "DICT", None) if output_cls is not None else None
+
+        for pass_name, pass_image in pass_images.items():
+            for oem in oem_candidates:
+                for psm in psm_candidates:
+                    tess_cfg = f"--oem {oem} --psm {psm} -c tessedit_char_whitelist={whitelist}"
+                    debug["tesseract_config"] = tess_cfg
+
+                    raw_text = str(pytesseract.image_to_string(pass_image, config=tess_cfg))
+                    debug["tesseract_raw"] = raw_text
+                    norm_text = _normalize_tesseract_text(raw_text, allowlist)
+
+                    conf_v: float | None = None
+                    if output_dict is not None:
+                        data = pytesseract.image_to_data(pass_image, config=tess_cfg, output_type=output_dict)
+                        if isinstance(data, dict):
+                            text_rows = data.get("text", [])
+                            conf_rows = data.get("conf", [])
+                            accepted_text: list[str] = []
+                            accepted_conf: list[float] = []
+                            if isinstance(text_rows, list) and isinstance(conf_rows, list):
+                                for txt, conf in zip(text_rows, conf_rows):
+                                    token = _normalize_tesseract_text(txt, allowlist)
+                                    if not token:
+                                        continue
+                                    conf_token = safe_float(conf)
+                                    if conf_token is None or conf_token < 0:
+                                        continue
+                                    accepted_text.append(token)
+                                    accepted_conf.append(conf_token)
+                            if accepted_text:
+                                joined = "".join(accepted_text)
+                                joined_norm = _normalize_tesseract_text(joined, allowlist)
+                                if joined_norm:
+                                    norm_text = joined_norm
+                                if accepted_conf:
+                                    conf_v = sum(accepted_conf) / len(accepted_conf) / 100.0
+
+                    debug["tesseract_text"] = norm_text
+                    if not norm_text or pattern.match(norm_text) is None:
+                        continue
+                    value = _parse_value_with_allowlist(norm_text, field_name, config)
+                    if value is None:
+                        continue
+                    score = _score_candidate(norm_text, conf_v if conf_v is not None else 0.85, True, value, prior_value)
+                    result = {
+                        "text": norm_text,
+                        "value": value,
+                        "conf": conf_v,
+                        "method": "fallback_tesseract",
+                        "ocr_pass": f"tesseract_{pass_name}",
+                        "imputed": False,
+                        "score": score,
+                        "psm": psm,
+                        "oem": oem,
+                        "whitelist": whitelist,
+                    }
+                    if best_attempt is None or score > float(best_attempt.get("score", -1.0)):
+                        best_attempt = result
+
+        if best_attempt is not None:
+            return best_attempt, debug
         return None, debug
     except Exception as exc:  # noqa: BLE001
         debug["tesseract_exception"] = str(exc)
