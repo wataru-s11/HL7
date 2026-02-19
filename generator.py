@@ -140,7 +140,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HL7 virtual central generator")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2575)
-    parser.add_argument("--interval", type=int, default=60, help="送信周期(秒)")
+    parser.add_argument("--interval", type=int, default=10, help="送信周期(秒)")
     parser.add_argument("--enabled", default="true", help="falseで無効化")
     parser.add_argument("--count", type=int, default=-1, help="送信ループ回数(-1:無限)")
     args = parser.parse_args()
