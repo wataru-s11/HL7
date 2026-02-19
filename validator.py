@@ -279,6 +279,14 @@ def get_record_capture_timestamp(rec: dict[str, Any]) -> datetime | None:
     return None
 
 
+def get_record_time(rec: dict[str, Any]) -> tuple[datetime | None, str | None]:
+    for key in ("ocr_timestamp", "capture_timestamp", "timestamp"):
+        dt = parse_iso8601(rec.get(key))
+        if dt is not None:
+            return dt, key
+    return None, None
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
@@ -310,6 +318,7 @@ def validate_records(
     fallback_to_nearest_past: bool,
     score_fields: set[str] | None,
     mismatch_details_enabled: bool,
+    time_window_sec: float,
 ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]]]:
     details: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -457,8 +466,17 @@ def validate_records(
         return per_item, score, record_mismatches, dt_sec, dt_skip_reason
 
     for rec in ocr_records:
-        ocr_dt = get_record_capture_timestamp(rec)
-        ocr_dt_corrected = ocr_dt + timedelta(seconds=lag_sec) if ocr_dt is not None else None
+        record_time, record_time_source = get_record_time(rec)
+        if record_time is None:
+            skip_reason = "record_time_unavailable"
+            skip_reason_counts[skip_reason] += 1
+            print(
+                f"[WARN] skip_record reason={skip_reason} "
+                f"timestamp={rec.get('timestamp')} image_path={rec.get('image_path')}"
+            )
+            continue
+
+        ocr_dt_corrected = record_time + timedelta(seconds=lag_sec)
 
         selected_payload: dict[str, Any] = monitor_cache_payload or {}
         selected_map: dict[str, dict[str, Any]] = monitor_truth or {}
@@ -473,9 +491,14 @@ def validate_records(
         chosen_dt_sec: float | None = None
 
         explicit_candidates = [
-            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
             ("cache_snapshot_path_before", rec.get("cache_snapshot_path_before")),
+            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
         ]
+        explicit_deltas: dict[str, float | None] = {
+            "cache_snapshot_path_before": None,
+            "cache_snapshot_path": None,
+        }
+        explicit_invalid_reason: str | None = None
         explicit_selected = False
         for explicit_key, explicit_raw_path in explicit_candidates:
             if explicit_raw_path is None:
@@ -486,11 +509,22 @@ def validate_records(
                 print(f"[WARN] explicit_truth_load_failed path={explicit_raw_path} error=not_found")
                 continue
             try:
+                snapshot_ts = parse_snapshot_timestamp(snapshot_path)
+                explicit_delta = abs((ocr_dt_corrected - snapshot_ts).total_seconds())
+                explicit_deltas[explicit_key] = explicit_delta
+                if explicit_delta > time_window_sec:
+                    explicit_invalid_reason = "explicit_out_of_window"
+                    print(
+                        f"[WARN] explicit_truth_skipped path={snapshot_path} "
+                        f"delta={explicit_delta:.3f}s window={time_window_sec:.3f}s"
+                    )
+                    continue
+
                 snapshot_data = load_snapshot_data(snapshot_path, snapshot_data_cache)
                 selected_payload = snapshot_data.payload
                 selected_map = snapshot_data.truth_map
                 selected_snapshot_path = str(snapshot_path)
-                selected_truth_dt = extract_message_datetime(selected_payload)
+                selected_truth_dt = snapshot_ts
                 selected_source = f"explicit:{explicit_key}"
                 selected_dt_source = "explicit_path"
                 if explicit_key == "cache_snapshot_path_before":
@@ -636,12 +670,17 @@ def validate_records(
             {
                 "timestamp": rec.get("timestamp"),
                 "capture_timestamp": rec.get("capture_timestamp", rec.get("timestamp")),
+                "record_time_source": record_time_source,
+                "record_time": record_time.isoformat(),
                 "validated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "truth_source": selected_source,
                 "truth_snapshot_used": selected_snapshot_path,
                 "delta_t_seconds": dt_sec,
                 "dt_source": selected_dt_source,
                 "candidate_count": selected_candidate_count,
+                "explicit_before_delta": explicit_deltas.get("cache_snapshot_path_before"),
+                "explicit_after_delta": explicit_deltas.get("cache_snapshot_path"),
+                "explicit_invalid_reason": explicit_invalid_reason,
                 "comparisons": chosen_per_item,
             }
         )
@@ -687,7 +726,7 @@ def validate_records(
     return details, metrics, mismatches
 
 
-def run_self_check(records: list[dict[str, Any]], rows: list[dict[str, Any]]) -> None:
+def run_self_check(records: list[dict[str, Any]], rows: list[dict[str, Any]], self_check: int) -> None:
     if not records:
         print("[SELF_CHECK] skipped reason=no_records")
         return
@@ -696,10 +735,20 @@ def run_self_check(records: list[dict[str, Any]], rows: list[dict[str, Any]]) ->
     capture_dt = parse_iso8601(first.get("capture_timestamp") or first.get("timestamp"))
     ocr_dt = parse_iso8601(first.get("ocr_timestamp"))
     frame_elapsed_ms = safe_float(first.get("frame_elapsed_ms"))
+    record_time, record_time_source = get_record_time(first)
 
     if capture_dt is None or ocr_dt is None or frame_elapsed_ms is None:
+        missing_fields: list[str] = []
+        if capture_dt is None:
+            missing_fields.append("capture_timestamp/timestamp")
+        if ocr_dt is None:
+            missing_fields.append("ocr_timestamp")
+        if frame_elapsed_ms is None:
+            missing_fields.append("frame_elapsed_ms")
         print(
             "[SELF_CHECK] skipped reason=missing_fields "
+            f"missing={','.join(missing_fields)} "
+            f"record_time_source={record_time_source} record_time={record_time.isoformat() if record_time else None} "
             f"capture_timestamp={first.get('capture_timestamp', first.get('timestamp'))} "
             f"ocr_timestamp={first.get('ocr_timestamp')} frame_elapsed_ms={first.get('frame_elapsed_ms')}"
         )
@@ -720,9 +769,26 @@ def run_self_check(records: list[dict[str, Any]], rows: list[dict[str, Any]]) ->
             print(f"[SELF_CHECK] validator_delta skipped reason=delta_none truth_source={truth_source}")
         else:
             status = "pass" if abs(delta_t) <= 3.0 else "warn"
+            reason = row.get("explicit_invalid_reason")
+            if reason == "explicit_out_of_window":
+                status = "warn"
             print(
                 f"[SELF_CHECK] validator_delta status={status} "
                 f"delta_t_seconds={delta_t:.3f} truth_source={truth_source}"
+                f" reason={reason if reason else 'none'}"
+            )
+
+    if self_check > 0:
+        print("[SELF_CHECK] recent_records")
+        for row in rows[-self_check:]:
+            print(
+                "[SELF_CHECK] "
+                f"timestamp={row.get('timestamp')} "
+                f"record_time_source={row.get('record_time_source')} "
+                f"record_time={row.get('record_time')} "
+                f"explicit_before_delta={row.get('explicit_before_delta')} "
+                f"explicit_after_delta={row.get('explicit_after_delta')} "
+                f"chosen_truth_source={row.get('truth_source')}"
             )
 
 
@@ -787,6 +853,12 @@ def main() -> None:
         "--score-fields",
         default=None,
         help="Comma-separated fields used for scoring metrics (e.g. HR,ART_S,ART_D,ART_M,CVP_M,RAP_M,SpO2)",
+    )
+    parser.add_argument(
+        "--self-check",
+        type=int,
+        default=0,
+        help="Print record_time and explicit deltas for the last N validated records",
     )
     args = parser.parse_args()
 
@@ -857,6 +929,7 @@ def main() -> None:
                 fallback_to_nearest_past=args.fallback_to_nearest_past,
                 score_fields=score_fields,
                 mismatch_details_enabled=False,
+                time_window_sec=args.time_window_sec,
             )
             score = (lag_metrics["match_rate"], lag_metrics["mean_abs_error"], lag_metrics["dt_mean_seconds"])
             if score[0] > best_score[0] or (score[0] == best_score[0] and score[1] < best_score[1]):
@@ -881,9 +954,10 @@ def main() -> None:
         fallback_to_nearest_past=args.fallback_to_nearest_past,
         score_fields=score_fields,
         mismatch_details_enabled=mismatch_details_enabled,
+        time_window_sec=args.time_window_sec,
     )
 
-    run_self_check(records, rows)
+    run_self_check(records, rows, args.self_check)
 
     output_path = ocr_path.parent / "validation_results.jsonl"
     write_jsonl(output_path, rows)
