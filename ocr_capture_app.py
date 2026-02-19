@@ -2725,7 +2725,9 @@ def main() -> None:
                         # so avoid shrinking and keep red boxes aligned with displayed numbers.
                         roi_inset_px = 0
                     rect_map = apply_inset_to_roi_map(red_rois, frame.shape, roi_inset_px)
-                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    capture_dt = datetime.now().astimezone()
+                    capture_timestamp = capture_dt.isoformat(timespec="milliseconds")
+                    stamp = capture_dt.strftime("%Y%m%d_%H%M%S_%f")[:-3]
                     roi_tick_dir: Path | None = None
                     roi_debug_input_dir: Path | None = None
 
@@ -3076,8 +3078,11 @@ def main() -> None:
 
                     frame_elapsed_ms = (time.perf_counter() - frame_start) * 1000.0
                     print(f"[PERF] frame_elapsed_ms={frame_elapsed_ms:.2f}")
+                    ocr_timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
                     record = {
-                        "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                        "timestamp": capture_timestamp,
+                        "capture_timestamp": capture_timestamp,
+                        "ocr_timestamp": ocr_timestamp,
                         "image_path": image_path.as_posix() if image_path else None,
                         "cache_snapshot_path_before": cache_snapshot_before,
                         "cache_snapshot_path": cache_snapshot,
