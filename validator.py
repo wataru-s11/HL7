@@ -271,12 +271,48 @@ def resolve_snapshot_path(raw_path: Any, ocr_results_path: Path) -> Path | None:
     return None
 
 
-def get_record_capture_timestamp(rec: dict[str, Any]) -> datetime | None:
-    for key in ("capture_timestamp", "timestamp"):
+def get_record_reference_timestamp(rec: dict[str, Any]) -> tuple[datetime | None, str]:
+    for key in ("capture_timestamp", "ocr_timestamp", "timestamp"):
         dt = parse_iso8601(rec.get(key))
         if dt is not None:
-            return dt
-    return None
+            return dt, key
+    return None, "none"
+
+
+def collect_auto_candidates(
+    ref_dt: datetime | None,
+    cache_candidates: list[SnapshotCandidate] | None,
+    cache_candidate_timestamps: list[float] | None,
+    lookback_sec: float,
+    max_candidates: int,
+    fallback_to_nearest_past: bool,
+) -> tuple[list[SnapshotCandidate], bool]:
+    if ref_dt is None or not cache_candidates or not cache_candidate_timestamps:
+        return [], False
+
+    ref_ts = ref_dt.timestamp()
+    end_idx = bisect.bisect_right(cache_candidate_timestamps, ref_ts)
+    start_idx = end_idx - 1
+    window_candidates: list[SnapshotCandidate] = []
+
+    while start_idx >= 0:
+        delta = ref_ts - cache_candidate_timestamps[start_idx]
+        if delta > lookback_sec:
+            break
+        window_candidates.append(cache_candidates[start_idx])
+        if max_candidates > 0 and len(window_candidates) >= max_candidates:
+            break
+        start_idx -= 1
+
+    fallback_used = False
+    if not window_candidates and fallback_to_nearest_past and end_idx > 0:
+        fallback_used = True
+        window_candidates = [cache_candidates[end_idx - 1]]
+
+    if max_candidates > 0:
+        window_candidates = window_candidates[:max_candidates]
+
+    return window_candidates, fallback_used
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -310,6 +346,7 @@ def validate_records(
     fallback_to_nearest_past: bool,
     score_fields: set[str] | None,
     mismatch_details_enabled: bool,
+    prefer_auto_cache: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]]]:
     details: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -324,6 +361,8 @@ def validate_records(
     snapshot_before_used = 0
     snapshot_used = 0
     explicit_used = 0
+    auto_used = 0
+    fallback_used = 0
     snapshot_missing = 0
     snapshot_load_error = 0
     skipped_truth_unavailable = 0
@@ -457,8 +496,8 @@ def validate_records(
         return per_item, score, record_mismatches, dt_sec, dt_skip_reason
 
     for rec in ocr_records:
-        ocr_dt = get_record_capture_timestamp(rec)
-        ocr_dt_corrected = ocr_dt + timedelta(seconds=lag_sec) if ocr_dt is not None else None
+        ref_dt, ref_dt_source = get_record_reference_timestamp(rec)
+        ocr_dt_corrected = ref_dt + timedelta(seconds=lag_sec) if ref_dt is not None else None
 
         selected_payload: dict[str, Any] = monitor_cache_payload or {}
         selected_map: dict[str, dict[str, Any]] = monitor_truth or {}
@@ -470,65 +509,20 @@ def validate_records(
 
         chosen_per_item: list[dict[str, Any]] = []
         chosen_score = {"matched": -1.0, "mean_abs_error": float("inf"), "delta": float("inf")}
-        chosen_dt_sec: float | None = None
 
-        explicit_candidates = [
-            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
-            ("cache_snapshot_path_before", rec.get("cache_snapshot_path_before")),
-        ]
-        explicit_selected = False
-        for explicit_key, explicit_raw_path in explicit_candidates:
-            if explicit_raw_path is None:
-                continue
-            snapshot_path = resolve_snapshot_path(explicit_raw_path, ocr_results_path)
-            if snapshot_path is None:
-                snapshot_missing += 1
-                print(f"[WARN] explicit_truth_load_failed path={explicit_raw_path} error=not_found")
-                continue
-            try:
-                snapshot_data = load_snapshot_data(snapshot_path, snapshot_data_cache)
-                selected_payload = snapshot_data.payload
-                selected_map = snapshot_data.truth_map
-                selected_snapshot_path = str(snapshot_path)
-                selected_truth_dt = extract_message_datetime(selected_payload)
-                selected_source = f"explicit:{explicit_key}"
-                selected_dt_source = "explicit_path"
-                if explicit_key == "cache_snapshot_path_before":
-                    snapshot_before_used += 1
-                else:
-                    snapshot_used += 1
-                explicit_selected = True
-                break
-            except Exception as exc:  # noqa: BLE001
-                snapshot_load_error += 1
-                print(f"[WARN] explicit_truth_load_failed path={snapshot_path} error={exc}")
-
-        if not explicit_selected and cache_candidates and cache_candidate_timestamps:
-            window_candidates: list[SnapshotCandidate] = []
-            if ocr_dt_corrected is not None:
-                ocr_ts = ocr_dt_corrected.timestamp()
-                end_idx = bisect.bisect_right(cache_candidate_timestamps, ocr_ts)
-                start_idx = end_idx - 1
-
-                while start_idx >= 0:
-                    candidate = cache_candidates[start_idx]
-                    delta = ocr_ts - cache_candidate_timestamps[start_idx]
-                    if delta > lookback_sec:
-                        break
-                    window_candidates.append(candidate)
-                    if max_candidates > 0 and len(window_candidates) >= max_candidates:
-                        break
-                    start_idx -= 1
-
-                if not window_candidates and fallback_to_nearest_past and end_idx > 0:
-                    nearest_fallback_used += 1
-                    window_candidates = [cache_candidates[end_idx - 1]]
-
-            if max_candidates > 0:
-                window_candidates = window_candidates[:max_candidates]
-            selected_candidate_count = len(window_candidates)
-
-            for candidate in window_candidates:
+        def try_auto_search() -> tuple[bool, bool]:
+            nonlocal selected_payload, selected_map, selected_snapshot_path, selected_truth_dt
+            nonlocal selected_source, selected_dt_source, selected_candidate_count, chosen_per_item, chosen_score
+            candidates, used_nearest_fallback = collect_auto_candidates(
+                ref_dt=ocr_dt_corrected,
+                cache_candidates=cache_candidates,
+                cache_candidate_timestamps=cache_candidate_timestamps,
+                lookback_sec=lookback_sec,
+                max_candidates=max_candidates,
+                fallback_to_nearest_past=fallback_to_nearest_past,
+            )
+            selected_candidate_count = len(candidates)
+            for candidate in candidates:
                 try:
                     snapshot_data = load_snapshot_data(candidate.path, snapshot_data_cache)
                     truth_payload = snapshot_data.payload
@@ -570,29 +564,88 @@ def validate_records(
                     selected_truth_dt = candidate.timestamp
                     selected_source = "cache_dir_search"
                     selected_dt_source = "cache_search"
+            return selected_snapshot_path is not None, used_nearest_fallback
 
-            if selected_snapshot_path is not None:
+        auto_selected = False
+        explicit_selected = False
+        fallback_used_this_record = False
+
+        if prefer_auto_cache:
+            auto_selected, fallback_used_this_record = try_auto_search()
+
+        explicit_candidates = [
+            ("cache_snapshot_path", rec.get("cache_snapshot_path")),
+            ("cache_snapshot_path_before", rec.get("cache_snapshot_path_before")),
+        ]
+
+        explicit_window = max(float(lookback_sec), 0.0)
+        explicit_was_outside_window = False
+
+        if not auto_selected:
+            for explicit_key, explicit_raw_path in explicit_candidates:
+                if explicit_raw_path is None:
+                    continue
+                snapshot_path = resolve_snapshot_path(explicit_raw_path, ocr_results_path)
+                if snapshot_path is None:
+                    snapshot_missing += 1
+                    print(f"[WARN] explicit_truth_load_failed path={explicit_raw_path} error=not_found")
+                    continue
+                try:
+                    snapshot_data = load_snapshot_data(snapshot_path, snapshot_data_cache)
+                    selected_payload = snapshot_data.payload
+                    selected_map = snapshot_data.truth_map
+                    selected_snapshot_path = str(snapshot_path)
+                    selected_truth_dt = extract_message_datetime(selected_payload) or parse_snapshot_timestamp(snapshot_path)
+                    selected_source = f"explicit:{explicit_key}"
+                    selected_dt_source = "explicit_path"
+                    explicit_selected = True
+                    if explicit_key == "cache_snapshot_path_before":
+                        snapshot_before_used += 1
+                    else:
+                        snapshot_used += 1
+
+                    if ocr_dt_corrected is not None and selected_truth_dt is not None:
+                        explicit_delta = abs((ocr_dt_corrected - selected_truth_dt).total_seconds())
+                        explicit_was_outside_window = explicit_delta > explicit_window
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    snapshot_load_error += 1
+                    print(f"[WARN] explicit_truth_load_failed path={snapshot_path} error={exc}")
+
+        if explicit_selected and explicit_was_outside_window and cache_candidates and cache_candidate_timestamps:
+            auto_selected, fallback_used_this_record = try_auto_search()
+            if auto_selected:
                 selected_source = "cache_dir_search"
-                selected_dt_source = "cache_search"
+                selected_dt_source = f"cache_search:{ref_dt_source}"
+                explicit_selected = False
 
-        if not explicit_selected and selected_snapshot_path is None:
-            if monitor_cache_payload is not None and monitor_truth is not None:
-                explicit_used += 1
-                selected_payload = monitor_cache_payload
-                selected_map = monitor_truth
-                selected_snapshot_path = None
-                selected_truth_dt = None
-                selected_source = "monitor_cache_fallback"
-                selected_dt_source = "monitor_cache"
-            else:
-                skipped_truth_unavailable += 1
-                skip_reason = "truth_unavailable"
-                skip_reason_counts[skip_reason] += 1
-                print(
-                    f"[WARN] skip_record reason={skip_reason} "
-                    f"timestamp={rec.get('timestamp')} image_path={rec.get('image_path')}"
-                )
-                continue
+        if not explicit_selected and not auto_selected and not prefer_auto_cache and cache_candidates and cache_candidate_timestamps:
+            auto_selected, fallback_used_this_record = try_auto_search()
+
+        if auto_selected:
+            auto_used += 1
+            if fallback_used_this_record:
+                nearest_fallback_used += 1
+                fallback_used += 1
+        elif explicit_selected:
+            explicit_used += 1
+        elif monitor_cache_payload is not None and monitor_truth is not None:
+            fallback_used += 1
+            selected_payload = monitor_cache_payload
+            selected_map = monitor_truth
+            selected_snapshot_path = None
+            selected_truth_dt = None
+            selected_source = "monitor_cache_fallback"
+            selected_dt_source = "monitor_cache"
+        else:
+            skipped_truth_unavailable += 1
+            skip_reason = "truth_unavailable"
+            skip_reason_counts[skip_reason] += 1
+            print(
+                f"[WARN] skip_record reason={skip_reason} "
+                f"timestamp={rec.get('timestamp')} image_path={rec.get('image_path')}"
+            )
+            continue
 
         per_item, score, record_mismatches, dt_sec, dt_skip_reason = evaluate_record(
             rec=rec,
@@ -656,6 +709,8 @@ def validate_records(
         "snapshot_before_used": float(snapshot_before_used),
         "snapshot_used": float(snapshot_used),
         "explicit_used": float(explicit_used),
+        "auto_used": float(auto_used),
+        "fallback_used": float(fallback_used),
         "snapshot_missing": float(snapshot_missing),
         "snapshot_load_error": float(snapshot_load_error),
         "skipped_truth_unavailable": float(skipped_truth_unavailable),
@@ -770,6 +825,11 @@ def main() -> None:
     )
     parser.add_argument("--select-by", default="score", choices=["score"], help="Candidate selection strategy")
     parser.add_argument(
+        "--prefer-auto-cache",
+        action="store_true",
+        help="Prefer cache-dir auto search over explicit cache_snapshot_path hints",
+    )
+    parser.add_argument(
         "--dump-mismatch",
         type=int,
         nargs="?",
@@ -857,6 +917,7 @@ def main() -> None:
                 fallback_to_nearest_past=args.fallback_to_nearest_past,
                 score_fields=score_fields,
                 mismatch_details_enabled=False,
+                prefer_auto_cache=args.prefer_auto_cache,
             )
             score = (lag_metrics["match_rate"], lag_metrics["mean_abs_error"], lag_metrics["dt_mean_seconds"])
             if score[0] > best_score[0] or (score[0] == best_score[0] and score[1] < best_score[1]):
@@ -881,6 +942,7 @@ def main() -> None:
         fallback_to_nearest_past=args.fallback_to_nearest_past,
         score_fields=score_fields,
         mismatch_details_enabled=mismatch_details_enabled,
+        prefer_auto_cache=args.prefer_auto_cache,
     )
 
     run_self_check(records, rows)
@@ -900,6 +962,8 @@ def main() -> None:
         f"snapshot_used={int(metrics['snapshot_used'])} "
         f"nearest_fallback_used={int(metrics['nearest_fallback_used'])} "
         f"explicit_used={int(metrics['explicit_used'])} "
+        f"auto_used={int(metrics['auto_used'])} "
+        f"fallback_used={int(metrics['fallback_used'])} "
         f"snapshot_missing={int(metrics['snapshot_missing'])} "
         f"snapshot_load_error={int(metrics['snapshot_load_error'])}"
     )

@@ -167,3 +167,18 @@ python tools/compare_ocr_engines.py --ocr-results dataset/20260217/ocr_results.j
 - `dataset/<YYYYMMDD>/images/*.png` : フレーム画像
 - `dataset/<YYYYMMDD>/ocr_results.jsonl` : 1フレーム=1JSON（append）
 - `dataset/<YYYYMMDD>/validation_results.jsonl` : validator比較結果
+
+### cache_snapshot_path ズレ改善の確認手順（dataset/20260219, last 50）
+
+```powershell
+# 1) 従来挙動（explicit cache優先）
+python validator.py --ocr-results dataset/20260219/ocr_results.jsonl --cache-dir dataset/20260219/cache --monitor-cache monitor_cache.json --last 50
+
+# 2) 新挙動（capture/ocr timestamp 優先で cache-dir 再探索）
+python validator.py --ocr-results dataset/20260219/ocr_results.jsonl --cache-dir dataset/20260219/cache --monitor-cache monitor_cache.json --last 50 --prefer-auto-cache --fallback-to-nearest-past
+```
+
+比較ポイント:
+- `[INFO] match_rate=...` が改善していること
+- `[INFO] delta_t_seconds mean/median/p90` が改善していること
+- `[INFO] truth_source_stats explicit_used/auto_used/fallback_used` の内訳で、`auto_used` が増えていること
