@@ -60,6 +60,7 @@ NUMERIC_RE = re.compile(r"^\d+(\.\d+)?$")
 ALLOWLIST = "0123456789."
 MONITORINFOF_PRIMARY = 0x00000001
 ROI_MAP_PATH = Path("dataset/layout/monitor_roi_map.json")
+CAPTURE_CACHE_FILENAME_PATTERN = re.compile(r"^(\d{8})_(\d{6})_(\d{3})(?:_before)?_monitor_cache\.json$")
 
 TEMPERATURE_VITALS = {"TSKIN", "TRECT"}
 INTEGER_PREFERRED_VITALS = {"HR", "SpO2", "RR", "rRESP", "EtCO2", "Ppeak", "PEEP", "O2conc", "NO", "BSR1", "BSR2"}
@@ -2380,6 +2381,53 @@ def maybe_launch_monitor(no_launch_monitor: bool, cache_path: Path) -> subproces
         return None
 
 
+def parse_cache_snapshot_timestamp(snapshot_path: Path) -> datetime:
+    match = CAPTURE_CACHE_FILENAME_PATTERN.match(snapshot_path.name)
+    if match:
+        day_part, time_part, ms_part = match.groups()
+        dt = datetime.strptime(day_part + time_part + ms_part, "%Y%m%d%H%M%S%f")
+        return dt.astimezone()
+    return datetime.fromtimestamp(snapshot_path.stat().st_mtime).astimezone()
+
+
+def resolve_cache_snapshot_paths(
+    cache_dir: Path,
+    capture_dt: datetime,
+    nearest_window_sec: float,
+    use_nearest_past_fallback: bool,
+) -> tuple[str | None, str | None, float | None]:
+    if not cache_dir.exists():
+        return None, None, None
+
+    candidates: list[tuple[Path, datetime, float]] = []
+    for path in cache_dir.glob("*_monitor_cache.json"):
+        try:
+            ts = parse_cache_snapshot_timestamp(path)
+        except OSError:
+            continue
+        delta = (ts - capture_dt).total_seconds()
+        candidates.append((path, ts, delta))
+
+    if not candidates:
+        return None, None, None
+
+    nearest_overall = min(candidates, key=lambda item: abs(item[2]))
+    selected = nearest_overall
+    if abs(nearest_overall[2]) > nearest_window_sec and use_nearest_past_fallback:
+        past_candidates = [item for item in candidates if item[1] <= capture_dt]
+        if past_candidates:
+            selected = max(past_candidates, key=lambda item: item[1])
+
+    before_candidates = [item for item in candidates if item[1] <= capture_dt]
+    selected_before = max(before_candidates, key=lambda item: item[1]) if before_candidates else None
+
+    return (
+        selected[0].as_posix() if selected else None,
+        selected_before[0].as_posix() if selected_before else None,
+        float(selected[2]) if selected else None,
+    )
+
+
 def run_validator_once(ocr_jsonl: Path, cache_path: Path, validator_config: Path, last_n: int) -> None:
     # MOD: オプションでcapture毎にvalidatorを実行
     cmd = [
@@ -2558,6 +2606,8 @@ def main() -> None:
     parser.add_argument("--run-validator", type=parse_bool, default=False)  # MOD
     parser.add_argument("--validator-last", type=int, default=50)  # MOD
     parser.add_argument("--validator-config", default="validator_config.json")  # MOD
+    parser.add_argument("--cache-nearest-window-sec", type=float, default=5.0)
+    parser.add_argument("--cache-nearest-past-fallback", type=parse_bool, default=True)
     parser.add_argument("--calibrate", action="store_true")
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
@@ -3072,9 +3122,20 @@ def main() -> None:
                     if args.debug_roi and full_overlay_img is not None:
                         cv2.imwrite(str(debug_dir / f"{stamp}_full_overlay.png"), full_overlay_img)
 
-                    cache_snapshot = copy_cache_snapshot(cache_path, day_dir, stamp)
-                    if not cache_snapshot:
+                    copied_cache_snapshot = copy_cache_snapshot(cache_path, day_dir, stamp)
+                    if not copied_cache_snapshot:
                         print(f"[WARN] cache snapshot failed at {stamp}", file=sys.stderr)
+
+                    resolved_cache_snapshot, resolved_cache_snapshot_before, snapshot_delta_seconds = resolve_cache_snapshot_paths(
+                        day_dir / "cache",
+                        capture_dt,
+                        nearest_window_sec=max(float(args.cache_nearest_window_sec), 0.0),
+                        use_nearest_past_fallback=bool(args.cache_nearest_past_fallback),
+                    )
+                    if resolved_cache_snapshot is None and copied_cache_snapshot is not None:
+                        resolved_cache_snapshot = copied_cache_snapshot
+                    if resolved_cache_snapshot_before is None and cache_snapshot_before is not None:
+                        resolved_cache_snapshot_before = cache_snapshot_before
 
                     frame_elapsed_ms = (time.perf_counter() - frame_start) * 1000.0
                     print(f"[PERF] frame_elapsed_ms={frame_elapsed_ms:.2f}")
@@ -3084,8 +3145,9 @@ def main() -> None:
                         "capture_timestamp": capture_timestamp,
                         "ocr_timestamp": ocr_timestamp,
                         "image_path": image_path.as_posix() if image_path else None,
-                        "cache_snapshot_path_before": cache_snapshot_before,
-                        "cache_snapshot_path": cache_snapshot,
+                        "cache_snapshot_path_before": resolved_cache_snapshot_before,
+                        "cache_snapshot_path": resolved_cache_snapshot,
+                        "cache_snapshot_delta_seconds": snapshot_delta_seconds,
                         "frame_elapsed_ms": frame_elapsed_ms,
                         "beds": beds,
                     }
