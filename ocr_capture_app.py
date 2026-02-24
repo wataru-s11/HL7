@@ -105,6 +105,9 @@ FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "RAP_M": re.compile(r"^-?\d{1,2}(?:\.\d+)?$"),
 }
 
+VT_ROI_EXPAND_VITALS = {"VTi", "VTe"}
+VT_ROI_WIDTH_EXPAND_RATIO = 0.30
+
 
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -828,6 +831,10 @@ def build_exported_rois(
                 ry1 = clamp(ry1, by1c, by2c - 1)
                 rx2 = clamp(rx2, rx1 + 1, bx2c)
                 ry2 = clamp(ry2, ry1 + 1, by2c)
+
+            if vital in VT_ROI_EXPAND_VITALS:
+                vt_expand_px = max(int(round((rx2 - rx1) * VT_ROI_WIDTH_EXPAND_RATIO)), 1)
+                rx2 = clamp(rx2 + vt_expand_px, rx1 + 1, frame_w)
 
             blue_rois[bed][vital] = (bx1c, by1c, bx2c, by2c)
             red_rois[bed][vital] = (rx1, ry1, rx2, ry2)
@@ -1900,18 +1907,24 @@ def crop_red_roi(frame: np.ndarray, roi_box: tuple[int, int, int, int], bed: str
     if vx1 >= vx2 or vy1 >= vy2:
         print(f"[WARN] invalid red ROI shape, skip {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2})", file=sys.stderr)
         return None, None
-    if vx1 < 0 or vy1 < 0 or vx2 > frame_w or vy2 > frame_h:
+    cx1 = clamp(vx1, 0, max(frame_w - 1, 0))
+    cy1 = clamp(vy1, 0, max(frame_h - 1, 0))
+    cx2 = clamp(vx2, cx1 + 1, frame_w)
+    cy2 = clamp(vy2, cy1 + 1, frame_h)
+
+    if cx1 != vx1 or cy1 != vy1 or cx2 != vx2 or cy2 != vy2:
         print(
-            f"[WARN] red ROI out of capture-image bounds, skip {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2}) frame=({frame_w}x{frame_h})",
+            f"[WARN] red ROI clipped to frame for {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2}) -> ({cx1}, {cy1}, {cx2}, {cy2}) frame=({frame_w}x{frame_h})",
             file=sys.stderr,
         )
+    if cx1 >= cx2 or cy1 >= cy2:
         return None, None
 
-    roi_crop = frame[vy1:vy2, vx1:vx2].copy()
+    roi_crop = frame[cy1:cy2, cx1:cx2].copy()
     if roi_crop.size == 0:
-        print(f"[WARN] empty red ROI crop, skip {bed}.{vital}: ({vx1}, {vy1}, {vx2}, {vy2})", file=sys.stderr)
+        print(f"[WARN] empty red ROI crop, skip {bed}.{vital}: ({cx1}, {cy1}, {cx2}, {cy2})", file=sys.stderr)
         return None, None
-    return roi_crop, (vx1, vy1, vx2, vy2)
+    return roi_crop, (cx1, cy1, cx2, cy2)
 
 
 def inset_roi_box(
@@ -2342,6 +2355,10 @@ def build_vital_rois(
                 vx2 = clamp(vx2 + _offset_from_adjust(vital_adjust, "dx2", cw, ch), vx1 + 1, cx2)
                 vy2 = clamp(vy2 + _offset_from_adjust(vital_adjust, "dy2", cw, ch), vy1 + 1, cy2)
 
+            if vital in VT_ROI_EXPAND_VITALS:
+                vt_expand_px = max(int(round((vx2 - vx1) * VT_ROI_WIDTH_EXPAND_RATIO)), 1)
+                vx2 = clamp(vx2 + vt_expand_px, vx1 + 1, frame_w)
+
             out[bed][vital] = (vx1, vy1, vx2, vy2)
             debug_meta[bed]["cell_boxes"][vital] = (cx1, cy1, cx2, cy2)
             debug_meta[bed]["cell_inner_boxes"][vital] = (cell_x1, cell_y1, cell_x2, cell_y2)
@@ -2588,6 +2605,7 @@ def main() -> None:
     parser.add_argument("--interval-ms", type=int, default=10000)
     parser.add_argument("--save-images", type=parse_bool, default=True)
     parser.add_argument("--debug-roi", type=parse_bool, default=False)
+    parser.add_argument("--debug-roi-vt", type=parse_bool, default=False)
     parser.add_argument("--debug-full-overlay", type=parse_bool, default=False)
     parser.add_argument("--debug-lines", type=parse_bool, default=False)
     parser.add_argument("--debug-window-rect", type=parse_bool, default=False)
@@ -2780,6 +2798,7 @@ def main() -> None:
                     stamp = capture_dt.strftime("%Y%m%d_%H%M%S_%f")[:-3]
                     roi_tick_dir: Path | None = None
                     roi_debug_input_dir: Path | None = None
+                    roi_debug_vt_dirs: dict[str, Path] = {}
 
                     image_path = None
                     if args.save_images:
@@ -2860,6 +2879,13 @@ def main() -> None:
                             roi_debug_input_dir = Path(args.outdir) / "roi_debug" / stamp
                             roi_debug_input_dir.mkdir(parents=True, exist_ok=True)
 
+                    if args.debug_roi_vt:
+                        base_debug_roi_dir = day_dir / "debug_roi"
+                        for vt_field in sorted(VT_ROI_EXPAND_VITALS):
+                            vt_dir = base_debug_roi_dir / vt_field
+                            vt_dir.mkdir(parents=True, exist_ok=True)
+                            roi_debug_vt_dirs[vt_field] = vt_dir
+
                     save_fail_roi = bool(config.get("debug_save_failed_roi", True))
                     if args.save_fail_roi is not None:
                         save_fail_roi = save_fail_roi and bool(args.save_fail_roi)
@@ -2927,6 +2953,9 @@ def main() -> None:
 
                                 if args.debug_roi and roi_debug_input_dir is not None:
                                     cv2.imwrite(str(roi_debug_input_dir / f"roi_{bed}_{vital}_raw.png"), roi_crop_raw)
+
+                                if args.debug_roi_vt and vital in roi_debug_vt_dirs:
+                                    cv2.imwrite(str(roi_debug_vt_dirs[vital] / f"{stamp}_{bed}_{vital}.png"), roi_crop_raw)
 
                                 if vital in {"CVP_M", "RAP_M"}:
                                     print(f"[INFO] fixed_roi_coords bed={bed} field={vital} coords={roi_coords}")
