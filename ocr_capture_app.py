@@ -111,6 +111,8 @@ CVP_RAP_MIN_TIGHTEN_HEIGHT_PX = 24
 VT_ROI_EXPAND_VITALS = {"VTi", "VTe"}
 VT_ROI_WIDTH_EXPAND_RATIO = 0.30
 VT_DIGIT_SPLIT_FIELDS = {"VTi", "VTe"}
+VT_DIGIT_WIDTH_RATIO = 0.28
+VT_DIGIT_INWARD_CROP_PX = 1
 VT_DIGIT_MIN_VALUE = 20
 VT_DIGIT_MAX_VALUE = 999
 
@@ -1421,13 +1423,26 @@ def digit_split_ocr(
     digit_values: list[str] = []
     digit_debug: list[dict[str, Any]] = []
 
+    digit_width = max(int(round(w * VT_DIGIT_WIDTH_RATIO)), 1)
+    max_width = max(w // 3, 1)
+    digit_width = min(digit_width, max_width)
+    total_width = digit_width * 3
+    right_start = max(w - total_width, 0)
+
     for idx in range(3):
-        x1 = int(round((w * idx) / 3.0))
-        x2 = int(round((w * (idx + 1)) / 3.0))
+        x1 = right_start + (idx * digit_width)
+        x2 = x1 + digit_width
         roi = gray[:, x1:x2]
         if roi.size == 0:
             digit_debug.append({"digit_index": idx, "reason": "empty_split"})
             return None, {"digit_debug": digit_debug}, digit_rois
+
+        raw_roi = roi.copy()
+        if roi.shape[1] > (VT_DIGIT_INWARD_CROP_PX * 2):
+            roi = roi[:, VT_DIGIT_INWARD_CROP_PX:-VT_DIGIT_INWARD_CROP_PX]
+
+        digit_rois[f"d{idx + 1}_raw"] = raw_roi
+        digit_rois[f"d{idx + 1}_cropped"] = roi
 
         padded = add_padding(roi, pad=10)
         up = upscale(padded, scale=4)
@@ -1464,6 +1479,9 @@ def digit_split_ocr(
             {
                 "digit_index": idx,
                 "selected": selected_digit,
+                "split_x": [int(x1), int(x2)],
+                "digit_width": int(digit_width),
+                "x_inward_crop_px": int(VT_DIGIT_INWARD_CROP_PX),
                 "attempts": attempts,
             }
         )
