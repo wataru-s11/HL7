@@ -72,8 +72,8 @@ DEFAULT_VITAL_RANGES: dict[str, tuple[float, float]] = {
     "ART_S": (0.0, 250.0),
     "ART_D": (0.0, 250.0),
     "ART_M": (0.0, 250.0),
-    "CVP_M": (0.0, 30.0),
-    "RAP_M": (0.0, 30.0),
+    "CVP_M": (0.0, 40.0),
+    "RAP_M": (0.0, 40.0),
     "rRESP": (0.0, 80.0),
     "EtCO2": (0.0, 120.0),
     "RR": (0.0, 80.0),
@@ -104,6 +104,9 @@ FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "CVP_M": re.compile(r"^-?\d{1,2}(?:\.\d+)?$"),
     "RAP_M": re.compile(r"^-?\d{1,2}(?:\.\d+)?$"),
 }
+
+CVP_RAP_MAX_VALUE = 40.0
+CVP_RAP_MIN_TIGHTEN_HEIGHT_PX = 24
 
 VT_ROI_EXPAND_VITALS = {"VTi", "VTe"}
 VT_ROI_WIDTH_EXPAND_RATIO = 0.30
@@ -1018,6 +1021,17 @@ def _field_pattern(field_name: str, allowlist: str) -> re.Pattern[str]:
     return re.compile(r"^\d{1,4}$")
 
 
+def _is_cvp_rap_field(field_name: str) -> bool:
+    upper = str(field_name or "").upper()
+    return "CVP" in upper or "RAP" in upper
+
+
+def _is_valid_cvp_rap_value(value: float | None) -> bool:
+    if value is None:
+        return False
+    return 0.0 <= float(value) <= CVP_RAP_MAX_VALUE
+
+
 def _normalize_ocr_text(text: str, allowlist: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     normalized = normalized.strip().replace(" ", "")
@@ -1202,6 +1216,23 @@ def _build_tesseract_pass_images(image: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def _build_single_digit_pass_images(image: np.ndarray, scale: float = 3.0) -> dict[str, np.ndarray]:
+    gray = to_gray(image)
+    scale_v = max(2.0, min(3.0, float(scale)))
+    # CVP/RAP向け: 1桁再試行は2〜3倍拡大＋軽い膨張で数字欠けを抑制する。
+    upscaled = cv2.resize(gray, None, fx=scale_v, fy=scale_v, interpolation=cv2.INTER_CUBIC)
+    otsu = binarize(upscaled, invert=False)
+    otsu_inv = binarize(upscaled, invert=True)
+    kernel = np.ones((2, 2), np.uint8)
+    return {
+        "gray": upscaled,
+        "otsu": otsu,
+        "otsu_inv": otsu_inv,
+        "otsu_dilate": cv2.dilate(otsu, kernel, iterations=1),
+        "otsu_inv_dilate": cv2.dilate(otsu_inv, kernel, iterations=1),
+    }
+
+
 def _tesseract_read_numeric(
     image: np.ndarray,
     *,
@@ -1211,6 +1242,8 @@ def _tesseract_read_numeric(
     prior_value: float | int | None,
     config: dict[str, Any],
     tighten_debug: dict[str, Any],
+    psm_candidates: list[int] | None = None,
+    oem_candidates: list[int] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     global _TESSERACT_WARNED
     pytesseract = _get_pytesseract(config)
@@ -1225,8 +1258,8 @@ def _tesseract_read_numeric(
         return None, debug
 
     whitelist = "".join(ch for ch in allowlist if ch in "0123456789.-") or "0123456789."
-    psm_candidates = [7, 8, 6, 13]
-    oem_candidates = [1, 3]
+    psm_candidates = psm_candidates or [7, 8, 6, 13]
+    oem_candidates = oem_candidates or [1, 3]
     tess_cfg = ""
     debug["tesseract_used"] = True
     debug["psm_candidates"] = psm_candidates
@@ -1309,6 +1342,61 @@ def _tesseract_read_numeric(
         return None, debug
 
 
+def _single_digit_retry_ocr(
+    image: np.ndarray,
+    *,
+    reader: easyocr.Reader,
+    field_name: str,
+    prior_value: float | int | None,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, np.ndarray]]:
+    allowlist = "0123456789"
+    pattern = re.compile(r"^\d{1,2}$")
+    pass_images = _build_single_digit_pass_images(image, scale=3.0)
+    debug: dict[str, Any] = {"used_psm": 10, "scale": 3.0, "dilate": 1, "single_digit_used": True}
+
+    tess_result, tess_debug = _tesseract_read_numeric(
+        pass_images["otsu_dilate"],
+        allowlist=allowlist,
+        pattern=pattern,
+        field_name=field_name,
+        prior_value=prior_value,
+        config=config,
+        tighten_debug={},
+        psm_candidates=[10],
+        oem_candidates=[1],
+    )
+    debug["tesseract_debug"] = tess_debug
+    if tess_result is not None and _is_valid_cvp_rap_value(safe_float(tess_result.get("value"))):
+        tess_result["method"] = "single_digit_tesseract"
+        tess_result["ocr_pass"] = "single_digit_tesseract"
+        return tess_result, debug, pass_images
+
+    best: dict[str, Any] | None = None
+    for pass_name in ("gray", "otsu_dilate", "otsu_inv_dilate"):
+        rows = _easyocr_read_numeric(reader, pass_images[pass_name], allowlist)
+        for raw_text, conf in rows:
+            norm = _normalize_ocr_text(raw_text, allowlist)
+            if not norm or pattern.match(norm) is None:
+                continue
+            parsed = _parse_value_with_allowlist(norm, field_name, config)
+            if not _is_valid_cvp_rap_value(parsed):
+                continue
+            score = _score_candidate(norm, conf, True, parsed, prior_value)
+            cand = {
+                "text": norm,
+                "value": parsed,
+                "conf": conf,
+                "method": "single_digit_easyocr",
+                "ocr_pass": f"single_digit_{pass_name}",
+                "imputed": False,
+                "score": score,
+            }
+            if best is None or score > float(best.get("score", -1.0)):
+                best = cand
+    return best, debug, pass_images
+
+
 def ocr_numeric_roi(
     img: np.ndarray,
     reader: easyocr.Reader,
@@ -1325,18 +1413,26 @@ def ocr_numeric_roi(
     cfg = config if isinstance(config, dict) else DEFAULT_CONFIG
     compare_mode = bool(cfg.get("ocr_compare_mode", False))
 
-    if field in {"CVP_M", "RAP_M"}:
-        subimg, tighten_debug = foreground_auto_tighten(img)
-    else:
+    is_cvp_rap = _is_cvp_rap_field(field)
+    if is_cvp_rap:
+        # CVP/RAP系はtightenで数字が欠けやすいため原則スキップ。
         subimg = img
         tighten_debug = {
             "boundingRect": None,
             "black_pixel_count": None,
             "tightened": False,
+            "tighten_skipped": True,
         }
+    else:
+        subimg, tighten_debug = foreground_auto_tighten(img)
+        if subimg.shape[0] < CVP_RAP_MIN_TIGHTEN_HEIGHT_PX:
+            subimg = img
+            tighten_debug["tightened"] = False
+            tighten_debug["tighten_reverted_min_height"] = CVP_RAP_MIN_TIGHTEN_HEIGHT_PX
+        tighten_debug.setdefault("tighten_skipped", False)
 
     padded = add_padding(subimg, pad=30)
-    upscale_scale = 4 if field in {"CVP_M", "RAP_M"} else 3
+    upscale_scale = 4 if is_cvp_rap else 3
     upscaled = upscale(padded, scale=upscale_scale)
     gray = to_gray(upscaled)
 
@@ -1384,6 +1480,8 @@ def ocr_numeric_roi(
             if not norm_text or not pattern.match(norm_text):
                 continue
             parsed_value = _parse_value_with_allowlist(norm_text, field, cfg)
+            if is_cvp_rap and not _is_valid_cvp_rap_value(parsed_value):
+                continue
             score = _score_candidate(norm_text, conf, True, parsed_value, prior_value)
             candidates.append(
                 {
@@ -1449,6 +1547,9 @@ def ocr_numeric_roi(
         )
         tess_elapsed_ms = (time.perf_counter() - tess_start) * 1000.0
         tesseract_debug.update(t_debug)
+        if is_cvp_rap and tesseract_result is not None:
+            if not _is_valid_cvp_rap_value(safe_float(tesseract_result.get("value"))):
+                tesseract_result = None
     if ocr_engine == "tesseract":
         final_winner = tesseract_result
         selected_engine = "tesseract"
@@ -1469,6 +1570,24 @@ def ocr_numeric_roi(
         selected_engine = "tesseract"
         chosen_pass = "tesseract"
         chosen_method = "fallback_tesseract"
+
+    # CVP/RAPは低信頼(0含む)や空振り時に1桁専用再試行を実行する。
+    single_digit_result = None
+    single_digit_debug: dict[str, Any] = {}
+    single_digit_passes: dict[str, np.ndarray] = {}
+    if is_cvp_rap and (final_winner is None or easyocr_low_conf):
+        single_digit_result, single_digit_debug, single_digit_passes = _single_digit_retry_ocr(
+            subimg,
+            reader=reader,
+            field_name=field,
+            prior_value=prior_value,
+            config=cfg,
+        )
+        if single_digit_result is not None:
+            final_winner = single_digit_result
+            selected_engine = "tesseract" if "tesseract" in str(single_digit_result.get("method", "")) else "easyocr"
+            chosen_pass = str(single_digit_result.get("ocr_pass") or "single_digit")
+            chosen_method = str(single_digit_result.get("method") or "single_digit_retry")
 
     ocr_exception = None
     ocr_traceback = None
@@ -1499,14 +1618,24 @@ def ocr_numeric_roi(
         "tesseract_whitelist": tesseract_result.get("whitelist") if isinstance(tesseract_result, dict) else None,
         "easyocr_candidate": easyocr_winner,
         "selected_engine": selected_engine,
+        "single_digit_debug": single_digit_debug,
     }
+    if single_digit_debug:
+        debug_payload["used_psm"] = single_digit_debug.get("used_psm")
+        debug_payload["scale"] = single_digit_debug.get("scale")
+        debug_payload["dilate"] = single_digit_debug.get("dilate")
     debug_images = {
         "raw": img,
         "tight": subimg,
         "pre": preprocessed_image,
         "tess": preprocessed_image,
+        "gray": pass_image_map.get("gray"),
+        "otsu": pass_image_map.get("otsu"),
+        "otsu_inv": pass_image_map.get("otsu_inv"),
         "passes": pass_image_map,
     }
+    if single_digit_passes:
+        debug_images["single_digit_passes"] = single_digit_passes
 
     if final_winner is not None and final_winner.get("value") is not None:
         return {
@@ -1647,6 +1776,7 @@ def save_failed_roi_artifacts(
             _show_failed_roi_popup(raw_img, bed=bed, field=field)
 
     pass_images = debug_images.get("passes") if isinstance(debug_images.get("passes"), dict) else {}
+    single_digit_passes = debug_images.get("single_digit_passes") if isinstance(debug_images.get("single_digit_passes"), dict) else {}
     tess_img = debug_images.get("tess")
     if isinstance(tess_img, np.ndarray) and tess_img.size > 0 and bool(debug_meta.get("tesseract_used", False)):
         tess_path = fail_roi_dir / f"{prefix}_tess.png"
@@ -1654,12 +1784,35 @@ def save_failed_roi_artifacts(
             paths["passes"]["tess"] = tess_path.as_posix()
             saved_files.append(tess_path.name)
 
+    if _is_cvp_rap_field(field):
+        required = {
+            "gray": pass_images.get("gray") if isinstance(pass_images.get("gray"), np.ndarray) else debug_images.get("gray"),
+            "otsu": pass_images.get("otsu") if isinstance(pass_images.get("otsu"), np.ndarray) else debug_images.get("otsu"),
+            "otsu_inv": pass_images.get("otsu_inv") if isinstance(pass_images.get("otsu_inv"), np.ndarray) else debug_images.get("otsu_inv"),
+        }
+        for req_name, req_img in required.items():
+            if not isinstance(req_img, np.ndarray) or req_img.size == 0:
+                continue
+            req_path = fail_roi_dir / f"{prefix}_pre_{req_name}.png"
+            if _safe_write_image(req_path, req_img):
+                paths["passes"][req_name] = req_path.as_posix()
+                if req_path.name not in saved_files:
+                    saved_files.append(req_path.name)
+
     for pass_name, pass_img in pass_images.items():
         if not isinstance(pass_img, np.ndarray) or pass_img.size == 0:
             continue
         pass_path = fail_roi_dir / f"{prefix}_pre_{pass_name}.png"
         if _safe_write_image(pass_path, pass_img):
             paths["passes"][pass_name] = pass_path.as_posix()
+            saved_files.append(pass_path.name)
+
+    for pass_name, pass_img in single_digit_passes.items():
+        if not isinstance(pass_img, np.ndarray) or pass_img.size == 0:
+            continue
+        pass_path = fail_roi_dir / f"{prefix}_single_{pass_name}.png"
+        if _safe_write_image(pass_path, pass_img):
+            paths["passes"][f"single_{pass_name}"] = pass_path.as_posix()
             saved_files.append(pass_path.name)
 
     meta_path = fail_roi_dir / f"{prefix}_meta.json"
@@ -1712,6 +1865,9 @@ def save_failed_roi_artifacts(
         "tesseract_raw": debug_meta.get("tesseract_raw", ""),
         "tesseract_config": debug_meta.get("tesseract_config"),
         "tesseract_exception": debug_meta.get("tesseract_exception"),
+        "used_psm": debug_meta.get("used_psm"),
+        "scale": debug_meta.get("scale"),
+        "dilate": debug_meta.get("dilate"),
         "paths": paths,
     }
     try:
