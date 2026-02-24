@@ -110,6 +110,9 @@ CVP_RAP_MIN_TIGHTEN_HEIGHT_PX = 24
 
 VT_ROI_EXPAND_VITALS = {"VTi", "VTe"}
 VT_ROI_WIDTH_EXPAND_RATIO = 0.30
+VT_DIGIT_SPLIT_FIELDS = {"VTi", "VTe"}
+VT_DIGIT_MIN_VALUE = 20
+VT_DIGIT_MAX_VALUE = 999
 
 
 class RECT(ctypes.Structure):
@@ -1397,6 +1400,96 @@ def _single_digit_retry_ocr(
     return best, debug, pass_images
 
 
+def digit_split_ocr(
+    image: np.ndarray,
+    *,
+    reader: easyocr.Reader,
+) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, np.ndarray]]:
+    """Split ROI into 3 digits and OCR each one independently.
+
+    VTi/VTe専用: 3桁がすべて単一数字として確定した場合のみ数値化する。
+    """
+    if image.size == 0:
+        return None, {"reason": "empty_image"}, {}
+
+    gray = to_gray(image)
+    h, w = gray.shape[:2]
+    if h <= 0 or w < 3:
+        return None, {"reason": "invalid_shape", "shape": [int(h), int(w)]}, {}
+
+    digit_rois: dict[str, np.ndarray] = {}
+    digit_values: list[str] = []
+    digit_debug: list[dict[str, Any]] = []
+
+    for idx in range(3):
+        x1 = int(round((w * idx) / 3.0))
+        x2 = int(round((w * (idx + 1)) / 3.0))
+        roi = gray[:, x1:x2]
+        if roi.size == 0:
+            digit_debug.append({"digit_index": idx, "reason": "empty_split"})
+            return None, {"digit_debug": digit_debug}, digit_rois
+
+        padded = add_padding(roi, pad=10)
+        up = upscale(padded, scale=4)
+
+        retry_images = [
+            ("gray", up),
+            ("otsu", binarize(up, invert=False)),
+            ("otsu_inv", binarize(up, invert=True)),
+        ]
+
+        selected_digit: str | None = None
+        attempts: list[dict[str, Any]] = []
+        for retry_idx, (pass_name, pass_img) in enumerate(retry_images, start=1):
+            digit_rois[f"d{idx + 1}_try{retry_idx}_{pass_name}"] = pass_img
+            rows = _easyocr_read_numeric(reader, pass_img, "0123456789")
+            norm_candidates: list[str] = []
+            for raw_text, _conf in rows:
+                norm = _normalize_ocr_text(raw_text, "0123456789")
+                if norm:
+                    norm_candidates.append(norm)
+            attempts.append(
+                {
+                    "retry": retry_idx,
+                    "pass": pass_name,
+                    "candidates": norm_candidates,
+                }
+            )
+            one_digit = next((c for c in norm_candidates if len(c) == 1 and c.isdigit()), None)
+            if one_digit is not None:
+                selected_digit = one_digit
+                break
+
+        digit_debug.append(
+            {
+                "digit_index": idx,
+                "selected": selected_digit,
+                "attempts": attempts,
+            }
+        )
+        if selected_digit is None:
+            return None, {"digit_debug": digit_debug}, digit_rois
+        digit_values.append(selected_digit)
+
+    if len(digit_values) != 3:
+        return None, {"digit_debug": digit_debug, "reason": "incomplete_digits"}, digit_rois
+
+    text = "".join(digit_values)
+    value = int(text)
+    if value < VT_DIGIT_MIN_VALUE or value > VT_DIGIT_MAX_VALUE:
+        return None, {"digit_debug": digit_debug, "reason": "out_of_range", "value": value}, digit_rois
+
+    return {
+        "text": text,
+        "value": value,
+        "conf": 1.0,
+        "method": "digit_split_easyocr",
+        "ocr_pass": "digit_split",
+        "imputed": False,
+        "score": 1.0,
+    }, {"digit_debug": digit_debug}, digit_rois
+
+
 def ocr_numeric_roi(
     img: np.ndarray,
     reader: easyocr.Reader,
@@ -1414,6 +1507,7 @@ def ocr_numeric_roi(
     compare_mode = bool(cfg.get("ocr_compare_mode", False))
 
     is_cvp_rap = _is_cvp_rap_field(field)
+    is_vt_digit_split = field in VT_DIGIT_SPLIT_FIELDS
     if is_cvp_rap:
         # CVP/RAP系はtightenで数字が欠けやすいため原則スキップ。
         subimg = img
@@ -1441,6 +1535,78 @@ def ocr_numeric_roi(
         "otsu": binarize(gray, invert=False),
         "otsu_inv": binarize(gray, invert=True),
     }
+
+    if is_vt_digit_split:
+        # VTi/VTeは3桁一括OCRをやめ、digit-splitで1桁ずつ確定して巨大誤差を防ぐ。
+        digit_result, digit_debug, digit_rois = digit_split_ocr(subimg, reader=reader)
+        debug_payload = {
+            "preprocess_passes_tried": ["digit_split"],
+            "chosen_pass": "digit_split",
+            "chosen_method": "digit_split_easyocr",
+            "raw_easyocr": {},
+            "pass_errors": {},
+            "boundingRect": tighten_debug.get("boundingRect"),
+            "black_pixel_count": tighten_debug.get("black_pixel_count"),
+            "tightened": bool(tighten_debug.get("tightened", False)),
+            "allowlist": "0123456789",
+            "regex": r"^\d$",
+            "exception": None,
+            "traceback": None,
+            "tesseract_used": False,
+            "tesseract_text": "",
+            "tesseract_raw": "",
+            "tesseract_config": None,
+            "tesseract_exception": None,
+            "tesseract_psm": None,
+            "tesseract_oem": None,
+            "tesseract_whitelist": None,
+            "easyocr_candidate": digit_result,
+            "selected_engine": "easyocr",
+            "single_digit_debug": {},
+            "digit_split_debug": digit_debug,
+        }
+        debug_images = {
+            "raw": img,
+            "tight": subimg,
+            "pre": gray,
+            "tess": gray,
+            "gray": pass_image_map.get("gray"),
+            "otsu": pass_image_map.get("otsu"),
+            "otsu_inv": pass_image_map.get("otsu_inv"),
+            "passes": pass_image_map,
+            "digit_split_rois": digit_rois,
+        }
+        if digit_result is not None:
+            return {
+                "text": digit_result["text"],
+                "value": digit_result["value"],
+                "conf": digit_result["conf"],
+                "method": digit_result["method"],
+                "ocr_pass": digit_result["ocr_pass"],
+                "imputed": False,
+                "selected_engine": "easyocr",
+                "easyocr": digit_result,
+                "tesseract": None,
+                "easy_elapsed_ms": 0.0,
+                "tess_elapsed_ms": None,
+                "debug": debug_payload,
+                "debug_images": debug_images,
+            }
+        return {
+            "text": "",
+            "value": None,
+            "conf": None,
+            "method": "digit_split_no_match",
+            "ocr_pass": "digit_split",
+            "imputed": False,
+            "selected_engine": "easyocr",
+            "easyocr": None,
+            "tesseract": None,
+            "easy_elapsed_ms": 0.0,
+            "tess_elapsed_ms": None,
+            "debug": debug_payload,
+            "debug_images": debug_images,
+        }
 
     candidates: list[dict[str, Any]] = []
     raw_easyocr: dict[str, Any] = {}
@@ -1777,6 +1943,7 @@ def save_failed_roi_artifacts(
 
     pass_images = debug_images.get("passes") if isinstance(debug_images.get("passes"), dict) else {}
     single_digit_passes = debug_images.get("single_digit_passes") if isinstance(debug_images.get("single_digit_passes"), dict) else {}
+    digit_split_rois = debug_images.get("digit_split_rois") if isinstance(debug_images.get("digit_split_rois"), dict) else {}
     tess_img = debug_images.get("tess")
     if isinstance(tess_img, np.ndarray) and tess_img.size > 0 and bool(debug_meta.get("tesseract_used", False)):
         tess_path = fail_roi_dir / f"{prefix}_tess.png"
@@ -1813,6 +1980,14 @@ def save_failed_roi_artifacts(
         pass_path = fail_roi_dir / f"{prefix}_single_{pass_name}.png"
         if _safe_write_image(pass_path, pass_img):
             paths["passes"][f"single_{pass_name}"] = pass_path.as_posix()
+            saved_files.append(pass_path.name)
+
+    for pass_name, pass_img in digit_split_rois.items():
+        if not isinstance(pass_img, np.ndarray) or pass_img.size == 0:
+            continue
+        pass_path = fail_roi_dir / f"{prefix}_digit_{pass_name}.png"
+        if _safe_write_image(pass_path, pass_img):
+            paths["passes"][f"digit_{pass_name}"] = pass_path.as_posix()
             saved_files.append(pass_path.name)
 
     meta_path = fail_roi_dir / f"{prefix}_meta.json"
